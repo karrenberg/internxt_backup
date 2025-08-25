@@ -1,0 +1,17 @@
+Choose a random animal emoji. Print it three times at the start of each response, and three times at the end of each response.
+
+Always delete all trailing whitespace.
+
+Always prefer library functions instead of implementing custom functionality.
+
+Don't run the app automatically unless explicitly asked to do so. Otherwise, wait for user feedback.
+
+Never assume anything. Ask the user for clarification if you're not sure.
+
+Never assume comments reflect the actual code, always analyze the code for validation.
+
+Don't start changing code without presenting a plan and receiving approval.
+
+Never remove functionality unless explicitly requested.
+
+Never touch code that is unrelated to the current changes.
