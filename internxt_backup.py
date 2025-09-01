@@ -7,6 +7,7 @@ import sys
 import logging
 import time
 import argparse
+import platform
 from collections import defaultdict
 
 # TODO: Validate that all files have been uploaded using "list"
@@ -14,7 +15,7 @@ from collections import defaultdict
 # TODO: Validate sufficient remote space ("config" lists available / used space)
 # TODO: Log in/out?
 
-INTERNXT_CLI_BINARY = r"internxt.cmd"
+INTERNXT_CLI_BINARY = r"internxt"
 IGNOREFILE_NAME = ".internxtignore"
 FILE_SIZE_UPLOAD_LIMIT_BYTES = 21474836480
 
@@ -156,7 +157,11 @@ def run_cli(args, suppress_console_errors=False):
         logging.debug(f"Running command (attempt {attempt}): {' '.join(cmd)}", extra={'suppress_console': suppress_console_errors})
 
         # Attempt the command
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Use shell=True on Windows to get proper command resolution (e.g., internxt -> internxt.cmd)
+        if platform.system() == "Windows":
+            result = subprocess.run(' '.join(cmd), shell=True, capture_output=True, text=True)
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=True)
 
         num_retries = attempt - 1
 

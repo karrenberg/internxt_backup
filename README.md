@@ -18,7 +18,8 @@ The internxt service frequently has connectivity issues that are not handled wel
 - If a CLI command fails all retries, the file is skipped.
 - All actions are logged to a log file. Some output such as a progress bar and summaries are also written to stdout.
 - If the script for some reason is stopped or crashes, the same command line can just be issued again and it will by definition of how it works resume where the last command stopped.
-- The script was written and tested against internxt CLI version 1.5.4 and node-v22.18.0-win-x64 under Windows 11.
+- The script was written and tested against internxt CLI version 1.5.4.
+- The script was written and tested on Windows 11 with node-v22.18.0-win-x64 and on Ubuntu Server 24.04 with node v22.19.0.
 
 ## Usage
 The script expects the user to be logged in. It does not perform login or logout at this point.
