@@ -22,17 +22,24 @@ The internxt service frequently has connectivity issues that are not handled wel
 - The script was written and tested on Windows 11 with node-v22.18.0-win-x64 and on Ubuntu Server 24.04 with node v22.19.0.
 
 ## Usage
-The script expects the user to be logged in. It does not perform login or logout at this point.
 The script requires the internxt CLI ("internxt.cmd" or "internxt") to be available in the shell. It also requires the node framework to be available.
 
 ### Examples 
 
 ```bash
 # Example including PATH setup and login/logout
-export PATH=/c/Users/Me/node-v22.18.0-win-x64/:$PATH
+set PATH=C:\Users\Me\node-v22.18.0-win-x64;%PATH%
 internxt login -e me@me.com
-python /c/Users/Me/internxt_backup/internxt_backup.py -s /c/Users/Me/pictures/ -t "" -d
+python C:\Users\Me\internxt_backup\internxt_backup.py -s C:\Users\Me\pictures -t "" -d
 internxt logout
+
+# Example with automatic login/logout (password requested interactively)
+# Windows cmd
+set PATH=C:\Users\Me\node-v22.18.0-win-x64;%PATH%
+python C:\Users\Me\internxt_backup\internxt_backup.py -e me@me.com -s C:\Users\Me\pictures -t "" -d
+# Linux
+export PATH=/usr/bin/:$PATH
+python ~/internxt_backup/internxt_backup.py -e me@me.com -s ~/pictures/ -t "" -d
 
 # Basic usage (upload to root folder)
 python internxt_backup.py --source /path/to/source --target ""
@@ -53,6 +60,7 @@ python internxt_backup.py --source /path/to/source --target "" --verbose
 ```
 
 ## Known Issues
+- Password prompt does not work in git bash, causes a hang. Use -p or log in/out manually.
 - Some files with special characters will upload fine but in subsequent runs fail to be recognized as existing files. This leads to repeated failed/skipped uploads, but the files are there.
 - I've encountered one weird case where uploading an entire folder would fail 2 random files (different ones when trying to re-upload the entire folder!). In subsequent runs, these files are reported to exist, but they don't appear in the web client. I don't think this is a problem with this script but with internxt. I have not reached out to them yet.
 

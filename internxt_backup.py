@@ -8,16 +8,22 @@ import logging
 import time
 import argparse
 import platform
+import signal
+import atexit
+import getpass
 from collections import defaultdict
 
 # TODO: Validate that all files have been uploaded using "list"
 # TODO: This is written against @internxt/cli/1.5.4 win32-x64 node-v22.18.0, validate version
 # TODO: Validate sufficient remote space ("config" lists available / used space)
-# TODO: Log in/out?
 
 INTERNXT_CLI_BINARY = r"internxt"
 IGNOREFILE_NAME = ".internxtignore"
 FILE_SIZE_UPLOAD_LIMIT_BYTES = 21474836480
+
+# Git bash has problems with the password input.
+if 'MSYSTEM' in os.environ and os.environ['MSYSTEM'].startswith(('MINGW', 'MSYS')):
+    print("Warning: Secure password input may not work in Git Bash. If it hangs, use cmd or PowerShell.")
 
 ################################################################################
 # Argument parsing
@@ -33,6 +39,8 @@ parser.add_argument("-l", "--full-console-log", dest="full_console_log", action=
 parser.add_argument("-r", "--max_num_retries", dest="max_num_retries", required=False, default=5, type=int, help="Set the maximum number of retries for internxt CLI commands (default: 5)")
 parser.add_argument("-w", "--retry_wait_seconds", dest="retry_wait_seconds", required=False, default=3, type=int, help="Set N, where N^{retry attempt} is the number of seconds to wait before the next retry (default: 3)")
 parser.add_argument("-d", "--allow_delete", dest="allow_delete", action='store_true', help="Delete remote files/folders if they do not exist locally or are ignored")
+parser.add_argument("-e", "--email", dest="email", required=False, help="Email for Internxt login")
+parser.add_argument("-p", "--password", dest="password", required=False, help="Password for Internxt login (not recommended to use on CLI)")
 args = parser.parse_args()
 
 MAX_NUM_RETRIES = args.max_num_retries
@@ -148,13 +156,41 @@ def normalize_encoding(text):
 # Internxt CLI
 ################################################################################
 
-def run_cli(args, suppress_console_errors=False):
+def sanitize_command_for_logging(cmd):
+    """Sanitize command arguments for logging to remove sensitive information."""
+    if not cmd or len(cmd) < 2:
+        return cmd
+
+    # Check if this is a login command
+    if cmd[1] != "login":
+        return cmd
+
+    # Create a copy to avoid modifying the original
+    sanitized_cmd = cmd.copy()
+
+    # Look for password arguments and mask them
+    for i, arg in enumerate(sanitized_cmd):
+        if arg.startswith("-p=") or arg.startswith("--password="):
+            # Mask the password part
+            if "=" in arg:
+                prefix, _ = arg.split("=", 1)
+                sanitized_cmd[i] = f"{prefix}=<hidden>"
+            else:
+                sanitized_cmd[i] = "<hidden>"
+
+    return sanitized_cmd
+
+def run_cli(args, force_interactive=False, stop_on_message=None, override_num_retries=None, suppress_console_errors=False):
     """Run the CLI with args and return parsed JSON output."""
-    cmd = [INTERNXT_CLI_BINARY] + args + ["--json", "-x"]
+    cmd = [INTERNXT_CLI_BINARY] + args + ["--json"] + ([] if force_interactive else ["-x"])
+
+    # Determine the number of retries.
+    cur_max_num_retries = override_num_retries if override_num_retries is not None else MAX_NUM_RETRIES
 
     # Retry logic for transient failures
-    for attempt in range(1, MAX_NUM_RETRIES + 1):
-        logging.debug(f"Running command (attempt {attempt}): {' '.join(cmd)}", extra={'suppress_console': suppress_console_errors})
+    for attempt in range(1, cur_max_num_retries + 1):
+        sanitized_cmd = sanitize_command_for_logging(cmd)
+        logging.debug(f"Running command (attempt {attempt}): {' '.join(sanitized_cmd)}", extra={'suppress_console': suppress_console_errors})
 
         # Attempt the command
         # Use shell=True on Windows to get proper command resolution (e.g., internxt -> internxt.cmd)
@@ -168,50 +204,124 @@ def run_cli(args, suppress_console_errors=False):
         try:
             out = json.loads(result.stdout)
         except Exception:
-            logging.error(f"Command failed (exception during JSON parsing) (attempt {attempt}): {' '.join(cmd)}", extra={'suppress_console': suppress_console_errors})
+            logging.error(f"Command failed (exception during JSON parsing) (attempt {attempt}): {' '.join(sanitized_cmd)}", extra={'suppress_console': suppress_console_errors})
             logging.error(result.stderr, extra={'suppress_console': suppress_console_errors})
             logging.error(result.stdout, extra={'suppress_console': suppress_console_errors})
-            if attempt < MAX_NUM_RETRIES:
+            if attempt < cur_max_num_retries:
                 time.sleep(RETRY_SLEEP_BASE_SECONDS ** attempt)
                 continue
-            return None, num_retries
+            return None, num_retries, False
 
         if not isinstance(out, dict):
             assert(result.returncode != 0)
-            logging.error(f"Command failed (invalid JSON) (attempt {attempt}): {' '.join(cmd)}", extra={'suppress_console': suppress_console_errors})
+            logging.error(f"Command failed (invalid JSON) (attempt {attempt}): {' '.join(sanitized_cmd)}", extra={'suppress_console': suppress_console_errors})
             logging.error(result.stderr, extra={'suppress_console': suppress_console_errors})
             logging.error(result.stdout, extra={'suppress_console': suppress_console_errors})
-            if attempt < MAX_NUM_RETRIES:
+            if attempt < cur_max_num_retries:
                 time.sleep(RETRY_SLEEP_BASE_SECONDS ** attempt)
                 continue
-            return None, num_retries
+            return None, num_retries, False
 
         if out.get("success") is not True:
             msg = out.get("message")
-            logging.error(f"Command failed (attempt {attempt}): {' '.join(cmd)}", extra={'suppress_console': suppress_console_errors})
+            if stop_on_message is not None and stop_on_message in msg:
+                return None, num_retries, True
+            logging.error(f"Command failed (attempt {attempt}): {' '.join(sanitized_cmd)}", extra={'suppress_console': suppress_console_errors})
             logging.error(f"Message: {msg}", extra={'suppress_console': suppress_console_errors})
-            if attempt < MAX_NUM_RETRIES:
+            if attempt < cur_max_num_retries:
                 time.sleep(RETRY_SLEEP_BASE_SECONDS ** attempt)
                 continue
-            return None, num_retries
+            return None, num_retries, False
 
         if result.returncode != 0:
-            logging.error(f"Command failed with returncode != 0 (attempt {attempt}): {' '.join(cmd)}", extra={'suppress_console': suppress_console_errors})
+            logging.error(f"Command failed with returncode != 0 (attempt {attempt}): {' '.join(sanitized_cmd)}", extra={'suppress_console': suppress_console_errors})
             logging.error(json.dumps(out, indent=2), extra={'suppress_console': suppress_console_errors})
-            if attempt < MAX_NUM_RETRIES:
+            if attempt < cur_max_num_retries:
                 time.sleep(RETRY_SLEEP_BASE_SECONDS ** attempt)
                 continue
-            return None, num_retries
+            return None, num_retries, False
 
         # Success!
-        return out, num_retries
+        return out, num_retries, False
+
+################################################################################
+# Log in
+################################################################################
 
 # Check if we're logged in.
-result, num_retries = run_cli(["whoami"])
+result, num_retries, stopped_on_message = run_cli(["whoami"], stop_on_message="You are not logged in")
 
-if result is None:
-    logging.error(f"whoami failed - not logged in?")
+# If something else went wrong, bail out.
+if result is None and not stopped_on_message:
+    logging.error(f"whoami failed")
     sys.exit(1)
+
+logged_in = False
+if stopped_on_message:
+    # Not logged in, check for credentials
+    if not args.email:
+        logging.error("Not logged in and no email provided. Please provide --email (and optionally --password) to log in.")
+        sys.exit(1)
+    logging.info("Not logged in.")
+    email = args.email
+    password = args.password
+    if password is None:
+        # Prompt for password securely
+        logging.info("Requesting password...")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            password = getpass.getpass(prompt=f"Password for {email}: ")
+        except Exception as e:
+            logging.error(f"Error reading password: {e}")
+            sys.exit(1)
+    if not password:
+        logging.error("No password provided. Exiting.")
+        sys.exit(1)
+    logging.info("Attempting login...")
+    result, num_retries, _ = run_cli(["login", f"-e={email}", f"-p={password}"])
+    if result is None:
+        logging.error(f"login failed")
+        sys.exit(1)
+    # Remember that we logged in automatically so we attempt to log out upon exit.
+    logging.info("Login successful")
+    logged_in = True
+
+################################################################################
+# Graceful shutdown handler
+################################################################################
+
+def graceful_shutdown():
+    """Helper function to handle graceful shutdown, including logout if logged in."""
+    if 'logged_in' in globals() and logged_in:
+        logging.info("Attempting to log out from Internxt...")
+        try:
+            # Logout doesn't have -x so we must run it in "interactive" mode
+            logout_result, _, _ = run_cli(["logout"], override_num_retries=3, force_interactive=True)
+            if logout_result is not None:
+                logging.info("Successfully logged out from Internxt")
+            else:
+                logging.warning("Failed to log out from Internxt")
+        except Exception as e:
+            logging.warning(f"Exception during logout: {e}")
+    else:
+        logging.debug("No logout needed (not logged in)")
+
+# Register the graceful shutdown function to be called on normal exit
+atexit.register(graceful_shutdown)
+
+# Set up signal handler for graceful shutdown
+def signal_handler(signum, frame):
+    """Handle system signals for graceful shutdown."""
+    logging.info(f"Received signal {signum}, initiating graceful shutdown...")
+    graceful_shutdown()
+    sys.exit(1)
+
+# Register signal handlers for common termination signals
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler)  # Termination signal
+if platform.system() != "Windows":
+    signal.signal(signal.SIGHUP, signal_handler)  # Hangup signal (Unix only)
 
 ################################################################################
 # Remote Folder Helpers & UUID Cache
@@ -222,7 +332,7 @@ remote_dir_cache = {}
 
 def list_remote_directory(folder_uuid):
     """List contents of remote directory, returns dict of {name: metadata}."""
-    result, num_retries = run_cli(["list", f"--id={folder_uuid}"])
+    result, num_retries, _ = run_cli(["list", f"--id={folder_uuid}"])
 
     if result is None:
         logging.error(f"list failed, exiting")
@@ -264,7 +374,7 @@ def get_or_create_folder(parent_items, parent_uuid, folder_name, parent_rel):
         return folder_uuid
 
     # Create new folder if it doesn't exist
-    out, num_retries = run_cli(["create-folder", f"--id={parent_uuid}", f"--name={folder_name}"])
+    out, num_retries, _ = run_cli(["create-folder", f"--id={parent_uuid}", f"--name={folder_name}"])
 
     if out is None:
         logging.error(f"create-folder failed, exiting")
@@ -396,7 +506,7 @@ def delete_remote_folder(rel_path, folder_uuid):
     folder_size = 0
 
     # Delete the folder.
-    out, _ = run_cli(["delete-permanently-folder", f"--id={folder_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
+    out, _, _ = run_cli(["delete-permanently-folder", f"--id={folder_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
     if out is None:
         logging.error(f"Failed to delete folder {rel_path}", extra={'suppress_console': ENABLE_SUPPRESS})
     else:
@@ -408,7 +518,7 @@ def delete_remote_folder(rel_path, folder_uuid):
 
 def delete_remote_file(rel_path, file_uuid, file_size):
     global removed_size
-    out, _ = run_cli(["delete-permanently-file", f"--id={file_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
+    out, _, _ = run_cli(["delete-permanently-file", f"--id={file_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
     if out is None:
         logging.error(f"Failed to delete file {rel_path}", extra={'suppress_console': ENABLE_SUPPRESS})
     else:
@@ -583,7 +693,7 @@ for abs_path, rel_path, file_size in all_local_files:
 
     # Upload the file.
     file_start = time.time()
-    out, num_retries = run_cli(["upload-file", "-f", abs_path, f"--destination={dest_folder_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
+    out, num_retries, _ = run_cli(["upload-file", "-f", abs_path, f"--destination={dest_folder_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
     elapsed_file = time.time() - file_start
 
     if out is None:
@@ -630,3 +740,6 @@ for folder, stats in folder_upload_stats.items():
     logging.info(f"Folder summary: '{folder}' | {stats['files']} files | {format_size(stats['size'])} | {stats['time']:.2f}s | {mbps:.2f} MB/s")
 
 logging.info(f"Backup successful.")
+
+# Ensure graceful shutdown on normal completion
+graceful_shutdown()
