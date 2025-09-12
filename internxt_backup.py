@@ -17,6 +17,8 @@ from collections import defaultdict
 # TODO: This is written against @internxt/cli/1.5.4 win32-x64 node-v22.18.0, validate version
 # TODO: Validate sufficient remote space ("config" lists available / used space)
 
+start_time = time.time()
+
 INTERNXT_CLI_BINARY = r"internxt"
 IGNOREFILE_NAME = ".internxtignore"
 FILE_SIZE_UPLOAD_LIMIT_BYTES = 21474836480
@@ -672,7 +674,7 @@ while stack:
         elapsed_total = time.time() - remote_check_start_time
         print_progress_bar(remote_check_file_counter, remote_check_total_files, rel_path, 0, elapsed_total, 0, 0, False)
 
-logging.info(f"\nFolder setup successful.")
+logging.info(f"\nFolder setup successful. Elapsed time: {format_hhmmss(time.time() - remote_check_start_time)}")
 logging.info(f"Created {len(created_folders)} new folders.")
 logging.info(f"Found {len(existing_files)} existing files in {len(existing_folders)} (sub-)folders")
 logging.info(f"Skipped {len(existing_files)}, size {format_size(existing_size)}.")
@@ -699,9 +701,9 @@ folder_upload_stats = {}
 
 num_files_for_upload = len(all_local_files) - len(existing_files)
 num_folders_for_upload = len(all_local_folders) - len(existing_folders)
-logging.info(f"Processing {num_files_for_upload} files in {num_folders_for_upload} (sub-)folders, total size: {format_size(num_bytes_to_upload)}.")
+logging.info(f"\nProcessing {num_files_for_upload} files in {num_folders_for_upload} (sub-)folders, total size: {format_size(num_bytes_to_upload)}.")
 
-start_time = time.time()
+upload_start_time = time.time()
 
 # From here on, don't print anything except the progress bar to stdout/stderr,
 # logging only goes to file.
@@ -715,12 +717,12 @@ for abs_path, rel_path, file_size in all_local_files:
     # Skip the upload if file already exists.
     existing_file = existing_files.get(rel_path)
     if existing_file:
-        elapsed_total = time.time() - start_time
+        elapsed_total = time.time() - upload_start_time
         print_progress_bar(uploaded_size, num_bytes_to_upload, f"{rel_path} [SKIP]", file_size, elapsed_total, num_retried_files, num_failed_files)
         continue
 
     # Print progress bar *before* upload so we see what's currently uploading.
-    elapsed_total = time.time() - start_time
+    elapsed_total = time.time() - upload_start_time
     print_progress_bar(uploaded_size, num_bytes_to_upload, rel_path, file_size, elapsed_total, num_retried_files, num_failed_files)
 
     # Upload the file.
@@ -752,12 +754,14 @@ for abs_path, rel_path, file_size in all_local_files:
     stats['time'] += elapsed_file
     stats['files'] += 1
 
+logging.info(f"\nUpload finished. Elapsed time: {format_hhmmss(time.time() - upload_start_time)}")
+
 ################################################################################
 # Re-enable stdout/stderr logging.
 SUPPRESS_STDOUT_STDERR = False
 ################################################################################
 
-logging.info("\nAll operations complete.")
+logging.info(f"\nAll operations complete.")
 logging.info(f"Folders created: {len(created_folders)}")
 logging.info(f"Folders removed: {len(removed_folders)}")
 logging.info(f"Files uploaded:  {len(uploaded_files)} ({format_size(uploaded_size)})")
@@ -771,7 +775,7 @@ for folder, stats in folder_upload_stats.items():
     mbps = (stats['size'] / 1024 / 1024) / stats['time'] if stats['time'] > 0 else 0
     logging.info(f"Folder summary: '{folder}' | {stats['files']} files | {format_size(stats['size'])} | {stats['time']:.2f}s | {mbps:.2f} MB/s")
 
-logging.info(f"Backup successful.")
+logging.info(f"\nBackup successful. Total time: {format_hhmmss(time.time() - start_time)}")
 
 # Ensure graceful shutdown on normal completion
 graceful_shutdown()
