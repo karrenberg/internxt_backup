@@ -34,6 +34,7 @@ python C:\Users\Me\internxt_backup\internxt_backup.py -s C:\Users\Me\pictures -t
 internxt logout
 
 # Example with automatic login/logout (password requested interactively)
+# This is known to not work properly in git bash, use -p or log in/out manually instead!
 # Windows cmd
 set PATH=C:\Users\Me\node-v22.18.0-win-x64;%PATH%
 python C:\Users\Me\internxt_backup\internxt_backup.py -e me@me.com -s C:\Users\Me\pictures -t "" -d

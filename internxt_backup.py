@@ -374,14 +374,14 @@ def get_or_create_folder(parent_items, parent_uuid, folder_name, parent_rel):
         return folder_uuid
 
     # Create new folder if it doesn't exist
-    out, num_retries, _ = run_cli(["create-folder", f"--id={parent_uuid}", f"--name={folder_name}"])
+    out, num_retries, _ = run_cli(["create-folder", f"--id={parent_uuid}", f"--name=\"{folder_name}\""])
 
     if out is None:
         logging.error(f"create-folder failed, exiting")
         sys.exit(1)
 
     if num_retries > 0:
-        logging.info(f"Create-folder command required {num_retries} retries: create-folder --id={parent_uuid} --name={folder_name}")
+        logging.info(f"Create-folder command required {num_retries} retries: create-folder --id={parent_uuid} --name=\"{folder_name}\"")
 
     folder_obj = out.get("folder")
     folder_uuid = folder_obj.get("uuid") if folder_obj else None
@@ -428,6 +428,7 @@ all_local_folders = []
 folder_subdir_map = defaultdict(list) # Maps a parent path -> list of subfolder names
 file_sizes = {}
 folder_sizes = {}
+folder_num_files = {}
 total_local_size = 0
 
 for cur_dir, dirs, files in os.walk(SRC_DIR):
@@ -441,6 +442,9 @@ for cur_dir, dirs, files in os.walk(SRC_DIR):
         continue
 
     all_local_folders.append(rel_cur_dir)
+
+    # Remember the number of files for each subfolder.
+    folder_num_files[rel_cur_dir] = len(files)
 
     # Add current dir as subfolder of its parent
     # If instead we added 'dirs' as subfolders of cur_dir we'd have to check .internxtignore files again
@@ -482,10 +486,55 @@ for folder, folder_size in folder_sizes.items():
     logging.info(f"  {folder}: {format_size(folder_size)}", extra={'suppress_console': ENABLE_SUPPRESS})
 
 ################################################################################
+# Progress bar
+################################################################################
+
+def print_progress_bar(uploaded, total, file, file_size, elapsed_total, num_retried_files, num_failed_files, useBytes=True, bar_len=40):
+    percent        = uploaded / total if total else 0
+    filled_len     = int(round(bar_len * percent))
+    bar            = '=' * filled_len + '-' * (bar_len - filled_len)
+    speed          = uploaded / elapsed_total if elapsed_total > 0 else 0
+    remaining_time = ( total - uploaded ) / speed if speed > 0 else 0
+
+    # Create the output string
+    barStr           = f"\r[{bar}] {percent * 100:5.1f}% "
+    progressStr      = f"| {format_size(uploaded)}/{format_size(total)} " if useBytes else f"| {int(uploaded)}/{int(total)} files "
+    numRetriedStr    = f"| retried: {num_retried_files} " if useBytes else f""
+    numFailedStr     = f"| failed: {num_failed_files} " if useBytes else f""
+    speedStr         = f"| avg: {format_size(speed)}/s " if useBytes else f"| avg: {speed:.1f} files/s "
+    elapsedTimeStr   = f"| elapsed: {format_hhmmss(elapsed_total)} "
+    remainingTimeStr = f"| remaining: {format_hhmmss(remaining_time)} "
+    fileStr          = f"| {file} "
+    fileSizeStr      = f"| file size: {format_size(file_size)}" if useBytes else f""
+
+    output = (
+        barStr +
+        progressStr +
+        numRetriedStr +
+        numFailedStr +
+        speedStr +
+        elapsedTimeStr +
+        remainingTimeStr +
+        fileStr +
+        fileSizeStr
+    )
+
+    # Print the output
+    sys.stdout.write(output)
+    sys.stdout.flush()
+
+    # Clear the line if the next file name is shorter
+    # This is done by moving the cursor back to the start of the line
+    # and writing spaces to overwrite the previous output
+    sys.stdout.write('\r' + ' ' * (len(output) - 1) + '\r')
+
+################################################################################
 # Folder creation
 # Create missing remote folders, collect all folder UUIDs
 # Find all existing files that we don't have to upload again
 ################################################################################
+
+logging.info(f"Checking for existing folders/files, creating missing folders...")
 
 created_folders = []
 existing_folders = []
@@ -525,6 +574,11 @@ def delete_remote_file(rel_path, file_uuid, file_size):
         # Update stats after deletion.
         removed_files.append(rel_path)
         removed_size += file_size
+
+# Variables for progress bar.
+remote_check_file_counter = 0
+remote_check_start_time = time.time()
+remote_check_total_files = len(all_local_files)
 
 while stack:
     rel_cur_dir, folder_uuid = stack.pop()
@@ -578,6 +632,11 @@ while stack:
                 logging.error(f"Invalid size format for file {rel_path}: {metadata.get('size')}", extra={'suppress_console': ENABLE_SUPPRESS})
                 continue
 
+            # Progress bar update for each file
+            remote_check_file_counter += 1
+            elapsed_total = time.time() - remote_check_start_time
+            print_progress_bar(remote_check_file_counter, remote_check_total_files, rel_path, remote_size, elapsed_total, 0, 0, False)
+
             # Fetch the local size. Returns None if the file does not exist locally.
             local_size = file_sizes.get(rel_path)
             if local_size is None:
@@ -607,7 +666,11 @@ while stack:
         subfolder_uuid = get_or_create_folder(folder_items, folder_uuid, name, rel_cur_dir)
         rel_path = normalize_rel_path(rel_cur_dir, name)
         created_folders.append((rel_path, subfolder_uuid))
-        stack.append((rel_path, subfolder_uuid))
+
+        assert(rel_path in folder_num_files)
+        remote_check_file_counter += folder_num_files[rel_path]
+        elapsed_total = time.time() - remote_check_start_time
+        print_progress_bar(remote_check_file_counter, remote_check_total_files, rel_path, 0, elapsed_total, 0, 0, False)
 
 logging.info(f"\nFolder setup successful.")
 logging.info(f"Created {len(created_folders)} new folders.")
@@ -618,37 +681,6 @@ logging.info(f"Removed {len(removed_folders)} folders (with all contained files 
 # Adjust total upload size to account for skipped files
 num_bytes_to_upload = total_local_size - existing_size
 logging.info(f"Total size to upload without skipped files: {format_size(num_bytes_to_upload)}")
-
-################################################################################
-# Progress bar
-################################################################################
-
-def print_progress_bar(uploaded, total, file, file_size, total_time, num_retried_files, num_failed_files, bar_len=40):
-    percent = uploaded / total if total else 0
-    filled_len = int(round(bar_len * percent))
-    bar = '=' * filled_len + '-' * (bar_len - filled_len)
-    speed = uploaded / total_time if total_time > 0 else 0
-
-    # Create the output string
-    output = (
-        f"\r[{bar}] {percent * 100:5.1f}% "
-        f"| {format_size(uploaded)}/{format_size(total)} "
-        f"| retried: {num_retried_files} "
-        f"| failed: {num_failed_files} "
-        f"| avg: {format_size(speed)}/s "
-        f"| elapsed: {format_hhmmss(total_time)} "
-        f"| {file} "
-        f"| file size: {format_size(file_size)}"
-    )
-
-    # Print the output
-    sys.stdout.write(output)
-    sys.stdout.flush()
-
-    # Clear the line if the next file name is shorter
-    # This is done by moving the cursor back to the start of the line
-    # and writing spaces to overwrite the previous output
-    sys.stdout.write('\r' + ' ' * (len(output) - 1) + '\r')
 
 ################################################################################
 # File upload
