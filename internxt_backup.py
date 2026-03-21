@@ -43,6 +43,7 @@ parser.add_argument("-w", "--retry_wait_seconds", dest="retry_wait_seconds", req
 parser.add_argument("-d", "--allow_delete", dest="allow_delete", action='store_true', help="Delete remote files/folders if they do not exist locally or are ignored")
 parser.add_argument("-e", "--email", dest="email", required=False, help="Email for Internxt login")
 parser.add_argument("-p", "--password", dest="password", required=False, help="Password for Internxt login (not recommended to use on CLI)")
+parser.add_argument("--progress-file", dest="progress_file", required=False, default=None, help="Append one line per uploaded file to this path (used by tests to detect upload progress)")
 args = parser.parse_args()
 
 MAX_NUM_RETRIES = args.max_num_retries
@@ -745,6 +746,9 @@ for abs_path, rel_path, file_size in all_local_files:
     logging.info(f"{action} file '{rel_path}' ({format_size(file_size)}) to folder UUID '{dest_folder_uuid}' in {elapsed_file:.2f}s ({mbps:.2f} MB/s)")
     uploaded_files.append((rel_path, file_size))
     uploaded_size += file_size
+    if args.progress_file:
+        with open(args.progress_file, 'a', encoding='utf-8') as _pf:
+            _pf.write(rel_path + '\n')
     # Invalidate folder cache since we modified it
     remote_dir_cache.pop(dest_folder_uuid, None)
 
