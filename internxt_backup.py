@@ -11,7 +11,7 @@ import platform
 import signal
 import atexit
 import getpass
-from collections import defaultdict
+from urllib.parse import unquote
 
 # TODO: Validate that all files have been uploaded using "list"
 # TODO: This is written against @internxt/cli/1.5.4 win32-x64 node-v22.18.0, validate version
@@ -35,7 +35,7 @@ if 'MSYSTEM' in os.environ and os.environ['MSYSTEM'].startswith(('MINGW', 'MSYS'
 # TODO: Take "DST_DIR" arg (relative path string), create "find_id" helper, convert path to DEST_ROOT_ID
 parser = argparse.ArgumentParser(description="Backup uploader script.")
 parser.add_argument("-s", "--source", dest="src_dir", required=True, help="Source directory to upload")
-parser.add_argument("-t", "--target", dest="dest_id", required=True, help="Destination base folder UUID")
+parser.add_argument("-t", "--target", dest="dest_id", required=True, nargs='?', const='', default=None, help="Destination base folder UUID (empty string or omit value for drive root)")
 parser.add_argument("-v", "--verbose", dest="verbose_mode", action='store_true', help="Enable verbose logging")
 parser.add_argument("-l", "--full-console-log", dest="full_console_log", action='store_true', help="log everything that is logged to file to the console as well")
 parser.add_argument("-r", "--max_num_retries", dest="max_num_retries", required=False, default=5, type=int, help="Set the maximum number of retries for internxt CLI commands (default: 5)")
@@ -44,6 +44,7 @@ parser.add_argument("-d", "--allow_delete", dest="allow_delete", action='store_t
 parser.add_argument("-e", "--email", dest="email", required=False, help="Email for Internxt login")
 parser.add_argument("-p", "--password", dest="password", required=False, help="Password for Internxt login (not recommended to use on CLI)")
 parser.add_argument("--progress-file", dest="progress_file", required=False, default=None, help="Append one line per uploaded file to this path (used by tests to detect upload progress)")
+parser.add_argument("--no-prescan", dest="no_prescan", action='store_true', help="Skip pre-scan; show honest metrics without percentage and ETA (pre-scan is on by default)")
 args = parser.parse_args()
 
 MAX_NUM_RETRIES = args.max_num_retries
@@ -165,7 +166,7 @@ def sanitize_command_for_logging(cmd):
         return cmd
 
     # Check if this is a login command
-    if cmd[1] != "login":
+    if cmd[1] not in ("login", "login-legacy"):
         return cmd
 
     # Create a copy to avoid modifying the original
@@ -198,7 +199,12 @@ def run_cli(args, force_interactive=False, stop_on_message=None, override_num_re
         # Attempt the command
         # Use shell=True on Windows to get proper command resolution (e.g., internxt -> internxt.cmd)
         if platform.system() == "Windows":
-            result = subprocess.run(' '.join(cmd), shell=True, capture_output=True, text=True)
+            # shell=True is required to resolve .cmd files (e.g. internxt.cmd).
+            # Wrapping every arg in double-quotes makes & | < > ^ literal to cmd.exe.
+            # Known limitation: %VAR% inside arg values is still expanded by cmd.exe;
+            # filenames or passwords containing %WORD% patterns may be silently mangled.
+            cmd_str = ' '.join(f'"{a}"' for a in cmd)
+            result = subprocess.run(cmd_str, shell=True, capture_output=True, text=True)
         else:
             result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -216,10 +222,11 @@ def run_cli(args, force_interactive=False, stop_on_message=None, override_num_re
             return None, num_retries, False
 
         if not isinstance(out, dict):
-            assert(result.returncode != 0)
+            logging.warning(f"Command returned non-dict JSON (attempt {attempt}): {result.stdout[:200]}", extra={'suppress_console': suppress_console_errors})
             logging.error(f"Command failed (invalid JSON) (attempt {attempt}): {' '.join(sanitized_cmd)}", extra={'suppress_console': suppress_console_errors})
             logging.error(result.stderr, extra={'suppress_console': suppress_console_errors})
             logging.error(result.stdout, extra={'suppress_console': suppress_console_errors})
+            assert(result.returncode != 0)
             if attempt < cur_max_num_retries:
                 time.sleep(RETRY_SLEEP_BASE_SECONDS ** attempt)
                 continue
@@ -227,7 +234,7 @@ def run_cli(args, force_interactive=False, stop_on_message=None, override_num_re
 
         if out.get("success") is not True:
             msg = out.get("message")
-            if stop_on_message is not None and stop_on_message in msg:
+            if stop_on_message is not None and msg is not None and stop_on_message in msg:
                 return None, num_retries, True
             logging.error(f"Command failed (attempt {attempt}): {' '.join(sanitized_cmd)}", extra={'suppress_console': suppress_console_errors})
             logging.error(f"Message: {msg}", extra={'suppress_console': suppress_console_errors})
@@ -246,6 +253,9 @@ def run_cli(args, force_interactive=False, stop_on_message=None, override_num_re
 
         # Success!
         return out, num_retries, False
+
+    # max_num_retries=0 -> loop body never executes; fall through here.
+    return None, 0, False
 
 ################################################################################
 # Log in
@@ -282,7 +292,7 @@ if stopped_on_message:
         logging.error("No password provided. Exiting.")
         sys.exit(1)
     logging.info("Attempting login...")
-    result, num_retries, _ = run_cli(["login", f"-e={email}", f"-p={password}"])
+    result, num_retries, _ = run_cli(["login-legacy", f"-e={email}", f"-p={password}"])
     if result is None:
         logging.error(f"login failed")
         sys.exit(1)
@@ -296,19 +306,22 @@ if stopped_on_message:
 
 def graceful_shutdown():
     """Helper function to handle graceful shutdown, including logout if logged in."""
-    if 'logged_in' in globals() and logged_in:
-        logging.info("Attempting to log out from Internxt...")
-        try:
-            # Logout doesn't have -x so we must run it in "interactive" mode
-            logout_result, _, _ = run_cli(["logout"], override_num_retries=3, force_interactive=True)
-            if logout_result is not None:
-                logging.info("Successfully logged out from Internxt")
-            else:
-                logging.warning("Failed to log out from Internxt")
-        except Exception as e:
-            logging.warning(f"Exception during logout: {e}")
-    else:
-        logging.debug("No logout needed (not logged in)")
+    global logged_in
+    # 'logged_in' in globals() guard: sys.exit(1) can fire before logged_in is assigned.
+    if 'logged_in' not in globals() or not logged_in:
+        logging.info("Shutting down (no logout needed)")
+        return
+    logged_in = False   # set False BEFORE logout so a second call is a no-op even if logout raises
+    logging.info("Attempting to log out from Internxt...")
+    try:
+        # Logout doesn't have -x so we must run it in "interactive" mode
+        logout_result, _, _ = run_cli(["logout"], override_num_retries=3, force_interactive=True)
+        if logout_result is not None:
+            logging.info("Successfully logged out from Internxt")
+        else:
+            logging.warning("Failed to log out from Internxt")
+    except Exception as e:
+        logging.warning(f"Exception during logout: {e}")
 
 # Register the graceful shutdown function to be called on normal exit
 atexit.register(graceful_shutdown)
@@ -316,9 +329,8 @@ atexit.register(graceful_shutdown)
 # Set up signal handler for graceful shutdown
 def signal_handler(signum, frame):
     """Handle system signals for graceful shutdown."""
-    logging.info(f"Received signal {signum}, initiating graceful shutdown...")
-    graceful_shutdown()
-    sys.exit(1)
+    print(f"\nReceived signal {signum}, shutting down...", flush=True)
+    sys.exit(1)   # triggers atexit -> graceful_shutdown
 
 # Register signal handlers for common termination signals
 signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
@@ -346,17 +358,29 @@ def list_remote_directory(folder_uuid):
 
     items = {}
     for item in result.get("list", {}).get("folders", []):
-        if "plainName" in item:  # Use decrypted name if available
-            # Make sure we convert the result to UTF-8, otherwise file name matching is broken.
-            items[normalize_encoding(item["plainName"])] = item
-        else:
-            items[item["name"]] = item
+        if "plainName" not in item:
+            # Encrypted/opaque name: can never match a local folder name; skip rather than
+            # storing under item["name"] which would cause false deletions with --allow-delete.
+            logging.warning(f"Remote folder missing 'plainName' (uuid={item.get('uuid')}), skipping")
+            continue
+        # Use decrypted name (plainName) if available.
+        # Make sure we convert the result to UTF-8, otherwise file name matching is broken.
+        # See files loop below for the unquote() rationale and known edge case.
+        items[normalize_encoding(unquote(item["plainName"]))] = item
+
     for item in result.get("list", {}).get("files", []):
-        if "plainName" in item:  # Use decrypted name if available
-            # Make sure we convert the result to UTF-8, otherwise file name matching is broken.
-            items[normalize_encoding(item["plainName"]) + "." + item['type']] = item
-        else:
-            items[item["name"]] = item
+        if "plainName" not in item:
+            logging.warning(f"Remote file missing 'plainName' (uuid={item.get('uuid')}), skipping")
+            continue
+        ext = item.get("type") or ""   # API returns null (not "") for extension-less files
+        # Use decrypted name (plainName) if available.
+        # Make sure we convert the result to UTF-8, otherwise file name matching is broken.
+        # unquote() decodes percent-encoded UTF-8 sequences the API embeds in plainName
+        # (e.g. Käfer -> K%C3%A4fer -> Käfer). Known edge case: a file literally named
+        # "my%20file.txt" would be decoded to "my file.txt" and fail to match locally.
+        # This is accepted; non-ASCII filenames failing is far more common.
+        name = normalize_encoding(unquote(item["plainName"]))
+        items[f"{name}.{ext}" if ext else name] = item
 
     return items
 
@@ -373,18 +397,18 @@ def get_or_create_folder(parent_items, parent_uuid, folder_name, parent_rel):
     existing = parent_items.get(folder_name)
     if existing and existing.get("type") == "folder":
         folder_uuid = existing.get("uuid")
-        logging.info(f"Found existing folder '{folder_name}' in '{parent_rel}' -> ID: {folder_uuid}")
+        logging.info(f"Found existing folder '{folder_name}' in '{parent_rel}' -> ID: {folder_uuid}", extra={'suppress_console': ENABLE_SUPPRESS})
         return folder_uuid
 
     # Create new folder if it doesn't exist
-    out, num_retries, _ = run_cli(["create-folder", f"--id={parent_uuid}", f"--name=\"{folder_name}\""])
+    out, num_retries, _ = run_cli(["create-folder", f"--id={parent_uuid}", "--name", folder_name])
 
     if out is None:
         logging.error(f"create-folder failed, exiting")
         sys.exit(1)
 
     if num_retries > 0:
-        logging.info(f"Create-folder command required {num_retries} retries: create-folder --id={parent_uuid} --name=\"{folder_name}\"")
+        logging.info(f"Create-folder command required {num_retries} retries: create-folder --id={parent_uuid} --name {folder_name!r}")
 
     folder_obj = out.get("folder")
     folder_uuid = folder_obj.get("uuid") if folder_obj else None
@@ -423,148 +447,79 @@ DEST_ROOT_ID = get_or_create_folder_from_uuid(DEST_ROOT_ID, normalize_encoding(s
 folder_uuids["."] = DEST_ROOT_ID
 
 ################################################################################
-# Create list of local files/folders, compute sizes
+# Phase 1: Quick local scan (no network) - compute totals for progress display
 ################################################################################
 
-all_local_files = []
-all_local_folders = []
-folder_subdir_map = defaultdict(list) # Maps a parent path -> list of subfolder names
-file_sizes = {}
-folder_sizes = {}
-folder_num_files = {}
 total_local_size = 0
+total_folder_count = 0
+total_skipped_size = 0
+total_skipped_files = 0
 
 for cur_dir, dirs, files in os.walk(SRC_DIR):
     cur_dir = normalize_encoding(cur_dir)
-    rel_cur_dir = os.path.relpath(cur_dir, SRC_DIR)
-
     # Check for .internxtignore file and skip traversal
     if IGNOREFILE_NAME in files:
-        logging.info(f"Folder contains {IGNOREFILE_NAME}, skipped: {rel_cur_dir}")
-        dirs.clear()  # prevents walking into subdirectories
-        continue
-
-    all_local_folders.append(rel_cur_dir)
-
-    # Remember the number of files for each subfolder.
-    folder_num_files[rel_cur_dir] = len(files)
-
-    # Add current dir as subfolder of its parent
-    # If instead we added 'dirs' as subfolders of cur_dir we'd have to check .internxtignore files again
-    if cur_dir != SRC_DIR:
-        parent = os.path.dirname(rel_cur_dir)
-        parent = '.' if parent == '' else parent
-        child = os.path.basename(rel_cur_dir)
-        folder_subdir_map[parent].append(child)
-
-    folder_size = 0
-    for file_name in files:
-        file_name = normalize_encoding(file_name)
-        abs_path = os.path.join(cur_dir, file_name)
-        rel_path = normalize_rel_path(rel_cur_dir, file_name)
-
-        try:
-            file_size = os.path.getsize(abs_path)
-        except Exception:
-            logging.error(f"Could not determine size of file {abs_path}")
-            file_size = 0
-
-        # Skip files that exceed the upload limit
-        if file_size > FILE_SIZE_UPLOAD_LIMIT_BYTES:
-            logging.info(f"File exceeds upload limit size ({format_size(FILE_SIZE_UPLOAD_LIMIT_BYTES)}, found {format_size(file_size)}), skipped: {rel_path}")
+        if cur_dir == SRC_DIR:
+            logging.warning(f"Source directory itself contains {IGNOREFILE_NAME} - this is likely a misconfiguration. The ignore file will be ignored for the source root.")
+        else:
+            dirs.clear()  # prevents walking into subdirectories
             continue
+    total_folder_count += 1
+    for f in files:
+        abs_path = os.path.join(cur_dir, f)
+        try:
+            sz = os.path.getsize(abs_path)
+        except Exception as e:
+            logging.error(f"Could not determine size of file {abs_path}: {e}")
+            continue
+        # Skip files that exceed the upload limit
+        if sz <= FILE_SIZE_UPLOAD_LIMIT_BYTES:
+            total_local_size += sz
+        else:
+            total_skipped_size += sz
+            total_skipped_files += 1
 
-        all_local_files.append((abs_path, rel_path, file_size))
-
-        file_sizes[rel_path] = file_size
-        folder_size += file_size
-
-    folder_sizes[rel_cur_dir] = folder_size
-    total_local_size += folder_size
-
-# Log total size and folder sizes
-logging.info(f"Total size of local folder(s): {format_size(total_local_size)}")
-logging.info(f"Folder sizes:", extra={'suppress_console': ENABLE_SUPPRESS})
-for folder, folder_size in folder_sizes.items():
-    logging.info(f"  {folder}: {format_size(folder_size)}", extra={'suppress_console': ENABLE_SUPPRESS})
+logging.info(f"Local scan: {total_folder_count} folder(s), {format_size(total_local_size)} total.")
+if total_skipped_size > 0:
+    logging.info(f"  Skipped files that exceed upload limit ({format_size(FILE_SIZE_UPLOAD_LIMIT_BYTES)}): {total_skipped_files} file(s), {format_size(total_skipped_size)} total.")
 
 ################################################################################
-# Progress bar
+# Progress line helper
 ################################################################################
 
-def print_progress_bar(uploaded, total, file, file_size, elapsed_total, num_retried_files, num_failed_files, useBytes=True, bar_len=40):
-    percent        = uploaded / total if total else 0
-    filled_len     = int(round(bar_len * percent))
-    bar            = '=' * filled_len + '-' * (bar_len - filled_len)
-    speed          = uploaded / elapsed_total if elapsed_total > 0 else 0
-    remaining_time = ( total - uploaded ) / speed if speed > 0 else 0
+_last_line_len = 0
 
-    # Create the output string
-    barStr           = f"\r[{bar}] {percent * 100:5.1f}% "
-    progressStr      = f"| {format_size(uploaded)}/{format_size(total)} " if useBytes else f"| {int(uploaded)}/{int(total)} files "
-    numRetriedStr    = f"| retried: {num_retried_files} " if useBytes else f""
-    numFailedStr     = f"| failed: {num_failed_files} " if useBytes else f""
-    speedStr         = f"| avg: {format_size(speed)}/s " if useBytes else f"| avg: {speed:.1f} files/s "
-    elapsedTimeStr   = f"| elapsed: {format_hhmmss(elapsed_total)} "
-    remainingTimeStr = f"| remaining: {format_hhmmss(remaining_time)} "
-    fileStr          = f"| {file} "
-    fileSizeStr      = f"| file size: {format_size(file_size)}" if useBytes else f""
-
-    output = (
-        barStr +
-        progressStr +
-        numRetriedStr +
-        numFailedStr +
-        speedStr +
-        elapsedTimeStr +
-        remainingTimeStr +
-        fileStr +
-        fileSizeStr
-    )
-
-    # Print the output
-    sys.stdout.write(output)
-    sys.stdout.flush()
-
-    # Clear the line if the next file name is shorter
+def print_line(msg):
+    """Write a single updating status line to stdout, padding to overwrite previous content."""
+    global _last_line_len
+    # Clear the line if the next message is shorter than the previous one.
     # This is done by moving the cursor back to the start of the line
-    # and writing spaces to overwrite the previous output
-    sys.stdout.write('\r' + ' ' * (len(output) - 1) + '\r')
+    # and writing spaces to overwrite the previous output.
+    padded = msg + ' ' * max(0, _last_line_len - len(msg))
+    # Print the output
+    sys.stdout.write('\r' + padded)
+    sys.stdout.flush()
+    _last_line_len = len(msg)
 
 ################################################################################
-# Folder creation
-# Create missing remote folders, collect all folder UUIDs
-# Find all existing files that we don't have to upload again
+# Delete helpers
 ################################################################################
 
-logging.info(f"Checking for existing folders/files, creating missing folders...")
-
-created_folders = []
-existing_folders = []
-existing_files = {}
-existing_size = 0
 removed_folders = []
 removed_files = []
 removed_size = 0
 
-# DFS traversal of remote folder tree to create missing folders
-stack = [(".", DEST_ROOT_ID)]
-existing_folders.append((".", DEST_ROOT_ID))
-
 def delete_remote_folder(rel_path, folder_uuid):
-    global removed_size
     # TODO: Calculate the size of the folder. This can be an expensive operation so we don't do it for now.
     # folder_size = calculate_remote_folder_size(rel_path, folder_uuid)
-    folder_size = 0
 
     # Delete the folder.
     out, _, _ = run_cli(["delete-permanently-folder", f"--id={folder_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
     if out is None:
-        logging.error(f"Failed to delete folder {rel_path}", extra={'suppress_console': ENABLE_SUPPRESS})
+        logging.error(f"Failed to delete folder '{rel_path}'", extra={'suppress_console': ENABLE_SUPPRESS})
     else:
         # Update stats after deletion.
         removed_folders.append(rel_path)
-        removed_size += folder_size
         # Remove folder from cache.
         remote_dir_cache.pop(folder_uuid, None)
 
@@ -572,204 +527,354 @@ def delete_remote_file(rel_path, file_uuid, file_size):
     global removed_size
     out, _, _ = run_cli(["delete-permanently-file", f"--id={file_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
     if out is None:
-        logging.error(f"Failed to delete file {rel_path}", extra={'suppress_console': ENABLE_SUPPRESS})
+        logging.error(f"Failed to delete file '{rel_path}'", extra={'suppress_console': ENABLE_SUPPRESS})
     else:
         # Update stats after deletion.
         removed_files.append(rel_path)
         removed_size += file_size
 
-# Variables for progress bar.
-remote_check_file_counter = 0
-remote_check_start_time = time.time()
-remote_check_total_files = len(all_local_files)
+################################################################################
+# Optional pre-scan: walk remote to compute exact upload size for progress bar
+################################################################################
 
-while stack:
-    rel_cur_dir, folder_uuid = stack.pop()
+to_upload_size = None  # None = no prescan; int = exact bytes to upload
+to_upload_count = None  # None = no prescan; int = number of files to upload
 
-    # Delete remote folders not present locally
-    if rel_cur_dir not in folder_sizes:
-        if args.allow_delete:
-            logging.info(f"Deleting remote folder '{rel_cur_dir}' since it does not exist locally or is ignored", extra={'suppress_console': ENABLE_SUPPRESS})
-            delete_remote_folder(rel_cur_dir, folder_uuid)
-        continue
+if not args.no_prescan:
+    logging.info("Pre-scanning remote to calculate upload size...")
+    prescan_start = time.time()
 
-    folder_uuids[rel_cur_dir] = folder_uuid
+    # prescan_uuids mirrors folder_uuids but is never written to for non-existent folders.
+    # None means the folder does not exist remotely; all files inside need uploading.
+    prescan_uuids = {".": DEST_ROOT_ID}
+    to_upload_size = 0
+    to_upload_count = 0
 
-    folder_items = get_cached_dir_listing(folder_uuid)
+    for cur_dir, dirs, files in os.walk(SRC_DIR):
+        cur_dir = normalize_encoding(cur_dir)
+        rel_cur_dir = normalize_encoding(os.path.relpath(cur_dir, SRC_DIR))
 
-    # Initialize missing folders to the set of all subdirs
-    # We remove all folders that we also find remotely.
-    missing_subfolders = set(folder_subdir_map.get(rel_cur_dir, []))
-
-    # Check existing files/folders.
-    for name, metadata in folder_items.items():
-        name = normalize_encoding(name)
-        rel_path = normalize_rel_path(rel_cur_dir, name)
-
-        if metadata.get("type") == "folder":
-            subfolder_uuid = metadata.get("uuid")
-            if not subfolder_uuid:
-                logging.error(f"Could not find UUID for folder '{rel_path}'", extra={'suppress_console': ENABLE_SUPPRESS})
+        # Same .internxtignore skip logic as Phase 1
+        if IGNOREFILE_NAME in files:
+            if cur_dir != SRC_DIR:
+                dirs.clear()
                 continue
 
-            if rel_path in folder_sizes:
-                # The remote folder is also present locally -> recurse.
-                stack.append((rel_path, subfolder_uuid))
-                existing_folders.append((rel_path, subfolder_uuid))
-                # Remove existing folder from the "missing" list.
-                missing_subfolders.remove(name)
-            elif args.allow_delete:
-                # The remote folder does not exist locally -> delete it.
-                logging.info(f"Deleting remote folder '{rel_path}' since it does not exist locally or is ignored", extra={'suppress_console': ENABLE_SUPPRESS})
-                delete_remote_folder(rel_path, subfolder_uuid)
-        else:
-            file_uuid = metadata.get("uuid")
-            if not file_uuid:
-                logging.error(f"Could not find UUID for file '{rel_path}'", extra={'suppress_console': ENABLE_SUPPRESS})
-                continue
+        remote_uuid = prescan_uuids.get(rel_cur_dir)
 
-            # Fetch the remote size.
+        if remote_uuid is None:
+            # Folder absent remotely: every file in it (and all descendants) needs uploading
+            for f in files:
+                abs_path = os.path.join(cur_dir, f)
+                try:
+                    sz = os.path.getsize(abs_path)
+                except OSError:
+                    continue
+                if sz <= FILE_SIZE_UPLOAD_LIMIT_BYTES:
+                    to_upload_size += sz
+                    to_upload_count += 1
+            # Propagate None to all subdirectories
+            for d in dirs:
+                d_name = normalize_encoding(d)
+                prescan_uuids[normalize_rel_path(rel_cur_dir, d_name)] = None
+            continue
+
+        # Folder exists remotely: check its listing
+        remote_items = get_cached_dir_listing(remote_uuid)
+
+        # Propagate child folder UUIDs (or None if absent)
+        for d in dirs[:]:
+            d_name = normalize_encoding(d)
+            if os.path.isfile(os.path.join(cur_dir, d, IGNOREFILE_NAME)):
+                dirs.remove(d)
+                continue
+            item = remote_items.get(d_name)
+            child_uuid = item["uuid"] if (item and item.get("type") == "folder") else None
+            prescan_uuids[normalize_rel_path(rel_cur_dir, d_name)] = child_uuid
+
+        # Determine which files need uploading
+        for f in files:
+            f_name = normalize_encoding(f)
+            abs_path = os.path.join(cur_dir, f)
             try:
-                remote_size = int(metadata.get("size", 0))
-            except Exception:
-                logging.error(f"Invalid size format for file {rel_path}: {metadata.get('size')}", extra={'suppress_console': ENABLE_SUPPRESS})
+                file_size = os.path.getsize(abs_path)
+            except OSError:
                 continue
-
-            # Progress bar update for each file
-            remote_check_file_counter += 1
-            elapsed_total = time.time() - remote_check_start_time
-            print_progress_bar(remote_check_file_counter, remote_check_total_files, rel_path, remote_size, elapsed_total, 0, 0, False)
-
-            # Fetch the local size. Returns None if the file does not exist locally.
-            local_size = file_sizes.get(rel_path)
-            if local_size is None:
-                if args.allow_delete:
-                    # The remote file does not exist locally -> delete it.
-                    logging.info(f"Deleting remote file '{rel_path}' since it does not exist locally", extra={'suppress_console': ENABLE_SUPPRESS})
-                    delete_remote_file(rel_path, file_uuid, remote_size)
+            if file_size > FILE_SIZE_UPLOAD_LIMIT_BYTES:
                 continue
-
-            # If the size matches, skip the file.
-            # Otherwise, delete the remote file (= local file will be uploaded)
-            if remote_size == local_size:
-                logging.info(f"Skipped file '{rel_path}' (same size)", extra={'suppress_console': ENABLE_SUPPRESS})
-                existing_size += local_size
-                existing_files[rel_path] = file_uuid
+            remote_item = remote_items.get(f_name)
+            if remote_item is None:
+                to_upload_size += file_size
+                to_upload_count += 1
             else:
-                if args.allow_delete:
-                    logging.info(f"Remote file '{rel_path}' has different size, deleting", extra={'suppress_console': ENABLE_SUPPRESS})
-                    delete_remote_file(rel_path, file_uuid, remote_size)
-                else:
-                    logging.info(f"Skipped file '{rel_path}' (different size, overwrite disabled)", extra={'suppress_console': ENABLE_SUPPRESS})
-                    existing_size += local_size
-                    existing_files[rel_path] = file_uuid
+                try:
+                    remote_size = int(remote_item.get("size", 0))
+                except Exception:
+                    to_upload_size += file_size  # unreadable size: assume needs upload
+                    to_upload_count += 1
+                    continue
+                if remote_size != file_size and args.allow_delete:
+                    to_upload_size += file_size  # will be deleted and re-uploaded
+                    to_upload_count += 1
 
-    # Create missing subfolders
-    for name in missing_subfolders:
-        subfolder_uuid = get_or_create_folder(folder_items, folder_uuid, name, rel_cur_dir)
-        rel_path = normalize_rel_path(rel_cur_dir, name)
-        created_folders.append((rel_path, subfolder_uuid))
-
-        assert(rel_path in folder_num_files)
-        remote_check_file_counter += folder_num_files[rel_path]
-        elapsed_total = time.time() - remote_check_start_time
-        print_progress_bar(remote_check_file_counter, remote_check_total_files, rel_path, 0, elapsed_total, 0, 0, False)
-
-logging.info(f"\nFolder setup successful. Elapsed time: {format_hhmmss(time.time() - remote_check_start_time)}")
-logging.info(f"Created {len(created_folders)} new folders.")
-logging.info(f"Found {len(existing_files)} existing files in {len(existing_folders)} (sub-)folders")
-logging.info(f"Skipped {len(existing_files)}, size {format_size(existing_size)}.")
-logging.info(f"Removed {len(removed_folders)} folders (with all contained files and subfolders) and {len(removed_files)} files, size {format_size(removed_size)} (w/o folder size).")
-
-# Adjust total upload size to account for skipped files
-num_bytes_to_upload = total_local_size - existing_size
-logging.info(f"Total size to upload without skipped files: {format_size(num_bytes_to_upload)}")
+    prescan_elapsed = time.time() - prescan_start
+    logging.info(f"Pre-scan completed in {format_hhmmss(prescan_elapsed)}: {to_upload_count} files ({format_size(to_upload_size)}) to upload.")
 
 ################################################################################
-# File upload
+# Phase 2: os.walk combined check+upload
+#
+# Key correctness property: folder_uuids[rel_cur_dir] is always set before
+# os.walk visits a directory - root is pre-set above, every subdirectory is
+# pre-set by its parent's Step 4 before os.walk descends into it.
 ################################################################################
 
-uploaded_size = 0
+num_created_folders = 0
 uploaded_files = []
-
+skipped_files = []
 # Retry stats
+num_failed_files = 0
 num_retried_files = 0
 num_total_retries = 0
-num_failed_files = 0
-
+uploaded_size = 0
+skipped_size = 0
+processed_size = 0
+elapsed_upload_time = 0.0
+last_file_mbps = 0  # MB/s of the most recently uploaded file; None until first upload
 # For per-folder stats
 folder_upload_stats = {}
-
-num_files_for_upload = len(all_local_files) - len(existing_files)
-num_folders_for_upload = len(all_local_folders) - len(existing_folders)
-logging.info(f"\nProcessing {num_files_for_upload} files in {num_folders_for_upload} (sub-)folders, total size: {format_size(num_bytes_to_upload)}.")
+folder_local_size = {}   # rel_cur_dir -> total local file size (within upload limit)
+folder_remote_size = {}  # rel_cur_dir -> total remote file size before upload
+processed_folders = 0
 
 upload_start_time = time.time()
+logging.info(f"Starting backup: {total_folder_count} folder(s).")
 
-# From here on, don't print anything except the progress bar to stdout/stderr,
-# logging only goes to file.
-SUPPRESS_STDOUT_STDERR = True
+for cur_dir, dirs, files in os.walk(SRC_DIR):
+    cur_dir = normalize_encoding(cur_dir)
+    rel_cur_dir = normalize_encoding(os.path.relpath(cur_dir, SRC_DIR))
 
-for abs_path, rel_path, file_size in all_local_files:
-    dest_folder_rel = os.path.dirname(rel_path) if rel_path != '.' else '.'
-    dest_folder_uuid = folder_uuids.get(dest_folder_rel, DEST_ROOT_ID)
-    file_name = os.path.basename(rel_path)
+    # Step 1: get UUID for this directory.
+    # Direct access - KeyError here means a bug in Step 4 of the parent iteration.
+    folder_uuid = folder_uuids[rel_cur_dir]
 
-    # Skip the upload if file already exists.
-    existing_file = existing_files.get(rel_path)
-    if existing_file:
+    # Step 2: progress line.
+    processed_folders += 1
+    print_line(f"Checking [{processed_folders}/{total_folder_count}]: {rel_cur_dir}")
+
+    # Step 3: fetch remote listing for this directory.
+    remote_items = get_cached_dir_listing(folder_uuid)
+    # Compute total remote file size for this folder (files only, not subfolders).
+    _remote_sz = 0
+    for _r_item in remote_items.values():
+        if _r_item.get("type") != "folder":
+            try:
+                _remote_sz += int(_r_item.get("size", 0))
+            except Exception:
+                pass
+    folder_remote_size[rel_cur_dir] = _remote_sz
+
+    # Step 4: pre-create/find all immediate subdirectories; prune .internxtignore folders.
+    # Iterating dirs[:] (a copy) because we mutate dirs to control os.walk's descent.
+    # Track items deleted here so Step 5 doesn't attempt a second deletion.
+    ignored_and_deleted = set()
+    for d in dirs[:]:
+        d_name = normalize_encoding(d)
+        if os.path.isfile(os.path.join(cur_dir, d, IGNOREFILE_NAME)):
+            # Folder d contains .internxtignore - treat as ignored.
+            logging.info(f"Skipping folder with {IGNOREFILE_NAME}: {normalize_rel_path(rel_cur_dir, d_name)}", extra={'suppress_console': ENABLE_SUPPRESS})
+            if args.allow_delete:
+                existing = remote_items.get(d_name)
+                if existing and existing.get("type") == "folder":
+                    logging.info(f"Deleting remote ignored folder: {normalize_rel_path(rel_cur_dir, d_name)}", extra={'suppress_console': ENABLE_SUPPRESS})
+                    delete_remote_folder(normalize_rel_path(rel_cur_dir, d_name), existing["uuid"])
+                    ignored_and_deleted.add(d_name)
+            dirs.remove(d)   # prevents os.walk from descending into d
+            continue
+
+        # Get existing remote folder or create a new one; record UUID for Step 1 of the child visit.
+        was_existing = d_name in remote_items and remote_items[d_name].get("type") == "folder"
+        d_uuid = get_or_create_folder(remote_items, folder_uuid, d_name, rel_cur_dir)
+        if not was_existing:
+            num_created_folders += 1
+        folder_uuids[normalize_rel_path(rel_cur_dir, d_name)] = d_uuid
+
+    # Step 5: delete remote-only items (only when --allow-delete).
+    if args.allow_delete:
+        local_dir_names  = {normalize_encoding(d) for d in dirs}
+        local_file_keys  = {normalize_encoding(f) for f in files}
+
+        for r_name, r_item in list(remote_items.items()):
+            if r_name in ignored_and_deleted:
+                continue   # already deleted in Step 4
+            r_uuid = r_item.get("uuid")
+            if not r_uuid:
+                logging.warning(f"Remote item '{normalize_rel_path(rel_cur_dir, r_name)}' has no UUID, skipping", extra={'suppress_console': ENABLE_SUPPRESS})
+                continue
+            if r_item.get("type") == "folder":
+                if r_name not in local_dir_names:
+                    logging.info(f"Deleting remote-only folder: {normalize_rel_path(rel_cur_dir, r_name)}", extra={'suppress_console': ENABLE_SUPPRESS})
+                    delete_remote_folder(normalize_rel_path(rel_cur_dir, r_name), r_uuid)
+            else:
+                if r_name not in local_file_keys:
+                    try:
+                        r_size = int(r_item.get("size", 0))
+                    except Exception:
+                        logging.warning(f"Invalid size for remote file '{normalize_rel_path(rel_cur_dir, r_name)}': {r_item.get('size')!r}, treating as 0", extra={'suppress_console': ENABLE_SUPPRESS})
+                        r_size = 0
+                    logging.info(f"Deleting remote-only file: {normalize_rel_path(rel_cur_dir, r_name)}", extra={'suppress_console': ENABLE_SUPPRESS})
+                    delete_remote_file(normalize_rel_path(rel_cur_dir, r_name), r_uuid, r_size)
+
+    # Step 6: check and upload each local file in this directory.
+    for f in files:
+        f_name = normalize_encoding(f)    # normalized name - used for remote key lookup and logging
+        abs_path = os.path.join(cur_dir, f)  # raw OS name - must match actual filesystem entry
+        rel_path = normalize_rel_path(rel_cur_dir, f_name)
+
+        try:
+            file_size = os.path.getsize(abs_path)
+        except Exception:
+            logging.error(f"Could not determine size of '{abs_path}'")
+            num_failed_files += 1
+            continue
+
+        if file_size > FILE_SIZE_UPLOAD_LIMIT_BYTES:
+            logging.info(f"File exceeds upload limit size ({format_size(FILE_SIZE_UPLOAD_LIMIT_BYTES)}, found {format_size(file_size)}), skipped: {rel_path}")
+            continue
+
+        # Accumulate local file size for this folder (only files within upload limit).
+        folder_local_size[rel_cur_dir] = folder_local_size.get(rel_cur_dir, 0) + file_size
+
+        # f_name is the composite remote key: "stem.ext" or "stem" for extension-less files.
+        # This matches the key format built in list_remote_directory.
+        remote_item = remote_items.get(f_name)
+
+        # Guard: remote folder with same name as local file (name collision - skip safely).
+        if remote_item is not None and remote_item.get("type") == "folder":
+            logging.warning(f"Remote folder has same name as local file '{rel_path}', skipping file.")
+            continue
+
+        if remote_item is not None:
+            # Fetch the remote size.
+            try:
+                remote_size = int(remote_item.get("size", 0))
+            except Exception:
+                logging.error(f"Invalid size format for file {rel_path}: {remote_item.get('size')!r}", extra={'suppress_console': ENABLE_SUPPRESS})
+                remote_size = None
+
+            # If the size matches, skip the file.
+            if remote_size == file_size:
+                logging.info(f"Skipped '{rel_path}' (same size)", extra={'suppress_console': ENABLE_SUPPRESS})
+                skipped_files.append((rel_path, file_size))
+                skipped_size += file_size
+                processed_size += file_size
+                continue
+            # Otherwise, delete the remote file (= local file will be uploaded)
+            elif args.allow_delete:
+                logging.info(f"Remote '{rel_path}' has different size, replacing", extra={'suppress_console': ENABLE_SUPPRESS})
+                delete_remote_file(rel_path, remote_item["uuid"], remote_size or 0)
+                # fall through to upload
+            else:
+                if remote_size is None:
+                    logging.warning(f"Remote file '{rel_path}' has unreadable size, keeping remote copy. Use --allow-delete to replace.")
+                else:
+                    logging.warning(f"Remote file '{rel_path}' has different size (remote: {format_size(remote_size)}, local: {format_size(file_size)}). Keeping remote copy. Use --allow-delete to replace.")
+                skipped_files.append((rel_path, file_size))
+                skipped_size += file_size
+                processed_size += file_size
+                continue
+
+        # Show progress line before upload.
         elapsed_total = time.time() - upload_start_time
-        print_progress_bar(uploaded_size, num_bytes_to_upload, f"{rel_path} [SKIP]", file_size, elapsed_total, num_retried_files, num_failed_files)
-        continue
+        if elapsed_upload_time > 0 and uploaded_size > 0:
+            upload_rate = uploaded_size / elapsed_upload_time
+            avg_speed_str = f"{upload_rate / 1024 / 1024:.2f} MB/s"
+            last_speed_str = f"{last_file_mbps:.2f} MB/s"
+        else:
+            upload_rate = 0
+            avg_speed_str = "-- MB/s"
+            last_speed_str = "-- MB/s"
+        if to_upload_size is not None:
+            percent = uploaded_size / to_upload_size * 100 if to_upload_size else 0
+            eta_str = format_hhmmss((to_upload_size - uploaded_size) / upload_rate) if upload_rate else "--:--:--"
+            print_line(
+                f"[{percent:5.1f}%] {format_size(uploaded_size)}/{format_size(to_upload_size)}"
+                f" | ETA: {eta_str}"
+                f" | {avg_speed_str} (last: {last_speed_str})"
+                f" | elapsed: {format_hhmmss(elapsed_total)}"
+                f" | failed: {num_failed_files}"
+                f" | {rel_path} ({format_size(file_size)})"
+            )
+        else:
+            print_line(
+                f"[{processed_folders}/{total_folder_count} folders]"
+                f" {format_size(uploaded_size)} uploaded"
+                f" | {avg_speed_str} (last: {last_speed_str})"
+                f" | elapsed: {format_hhmmss(elapsed_total)}"
+                f" | failed: {num_failed_files}"
+                f" | {rel_path} ({format_size(file_size)})"
+            )
 
-    # Print progress bar *before* upload so we see what's currently uploading.
-    elapsed_total = time.time() - upload_start_time
-    print_progress_bar(uploaded_size, num_bytes_to_upload, rel_path, file_size, elapsed_total, num_retried_files, num_failed_files)
+        # Upload the file.
+        # SUPPRESS_STDOUT_STDERR hides the internxt CLI's own stdout/stderr during upload.
+        # try/finally guarantees it is re-enabled even if run_cli raises.
+        file_start = time.time()
+        SUPPRESS_STDOUT_STDERR = True
+        try:
+            out, num_retries, _ = run_cli(
+                ["upload-file", "-f", abs_path, f"--destination={folder_uuid}"],
+                suppress_console_errors=ENABLE_SUPPRESS
+            )
+        finally:
+            SUPPRESS_STDOUT_STDERR = False
+        elapsed_file = time.time() - file_start
 
-    # Upload the file.
-    file_start = time.time()
-    out, num_retries, _ = run_cli(["upload-file", "-f", abs_path, f"--destination={dest_folder_uuid}"], suppress_console_errors=ENABLE_SUPPRESS)
-    elapsed_file = time.time() - file_start
+        if out is None:
+            logging.error(f"upload-file failed, skipping '{rel_path}'")
+            num_failed_files += 1
+            continue
 
-    if out is None:
-        logging.error(f"upload-file failed, skipping {rel_path}")
-        num_failed_files += 1
-        continue
+        if num_retries > 0:
+            num_retried_files += 1
+            num_total_retries += num_retries
 
-    if num_retries > 0:
-        num_retried_files += 1
-        num_total_retries += num_retries
+        mbps = (file_size / 1024 / 1024) / elapsed_file if elapsed_file > 0 else 0
+        last_file_mbps = mbps
+        # Log upload to file only, with time and MB/s
+        logging.info(f"Uploaded '{rel_path}' ({format_size(file_size)}) to folder UUID '{folder_uuid}' in {elapsed_file:.2f}s ({mbps:.2f} MB/s)", extra={'suppress_console': ENABLE_SUPPRESS})
 
-    # Log upload to file only, with time and MB/s
-    mbps = (file_size / 1024 / 1024) / elapsed_file if elapsed_file > 0 else 0
-    action = "Updated" if existing_file is not None else "Uploaded"
-    logging.info(f"{action} file '{rel_path}' ({format_size(file_size)}) to folder UUID '{dest_folder_uuid}' in {elapsed_file:.2f}s ({mbps:.2f} MB/s)")
-    uploaded_files.append((rel_path, file_size))
-    uploaded_size += file_size
-    if args.progress_file:
-        with open(args.progress_file, 'a', encoding='utf-8') as _pf:
-            _pf.write(rel_path + '\n')
-    # Invalidate folder cache since we modified it
-    remote_dir_cache.pop(dest_folder_uuid, None)
+        uploaded_files.append((rel_path, file_size))
+        uploaded_size += file_size
+        processed_size += file_size
+        elapsed_upload_time += elapsed_file
 
-    # Per-folder stats
-    stats = folder_upload_stats.setdefault(dest_folder_rel, {'size': 0, 'time': 0, 'files': 0})
-    stats['size'] += file_size
-    stats['time'] += elapsed_file
-    stats['files'] += 1
+        if args.progress_file:
+            with open(args.progress_file, 'a', encoding='utf-8') as _pf:
+                _pf.write(rel_path + '\n')
+
+        # Invalidate folder cache since we modified it
+        remote_dir_cache.pop(folder_uuid, None)
+
+        # Per-folder stats
+        stats = folder_upload_stats.setdefault(rel_cur_dir, {'size': 0, 'time': 0, 'files': 0})
+        stats['size'] += file_size
+        stats['time'] += elapsed_file
+        stats['files'] += 1
 
 logging.info(f"\nUpload finished. Elapsed time: {format_hhmmss(time.time() - upload_start_time)}")
 
 ################################################################################
-# Re-enable stdout/stderr logging.
-SUPPRESS_STDOUT_STDERR = False
+# Summary
 ################################################################################
 
+# End the progress line cleanly before printing multi-line summary.
+sys.stdout.write('\n')
+sys.stdout.flush()
+
 logging.info(f"\nAll operations complete.")
-logging.info(f"Folders created: {len(created_folders)}")
+logging.info(f"Folders created: {num_created_folders}")
 logging.info(f"Folders removed: {len(removed_folders)}")
 logging.info(f"Files uploaded:  {len(uploaded_files)} ({format_size(uploaded_size)})")
-logging.info(f"Files skipped:   {len(existing_files)} ({format_size(existing_size)})")
+logging.info(f"Files skipped:   {len(skipped_files)}  ({format_size(skipped_size)})")
 logging.info(f"Files retried:   {num_retried_files} ({num_total_retries} retries total)")
 logging.info(f"Files failed:    {num_failed_files}")
 logging.info(f"Files removed:   {len(removed_files)} ({format_size(removed_size)})")
@@ -779,7 +884,13 @@ for folder, stats in folder_upload_stats.items():
     mbps = (stats['size'] / 1024 / 1024) / stats['time'] if stats['time'] > 0 else 0
     logging.info(f"Folder summary: '{folder}' | {stats['files']} files | {format_size(stats['size'])} | {stats['time']:.2f}s | {mbps:.2f} MB/s")
 
-logging.info(f"\nBackup successful. Total time: {format_hhmmss(time.time() - start_time)}")
+# Log per-folder size overview: local size vs remote size before upload vs uploaded size
+logging.info(f"\nPer-folder size overview:", extra={'suppress_console': ENABLE_SUPPRESS})
+all_folders = sorted(set(list(folder_local_size) + list(folder_remote_size)))
+for folder in all_folders:
+    local_sz    = folder_local_size.get(folder, 0)
+    remote_sz   = folder_remote_size.get(folder, 0)
+    uploaded_sz = folder_upload_stats.get(folder, {}).get('size', 0)
+    logging.info(f"  '{folder}': local={format_size(local_sz)}, remote={format_size(remote_sz)}, uploaded={format_size(uploaded_sz)}", extra={'suppress_console': ENABLE_SUPPRESS})
 
-# Ensure graceful shutdown on normal completion
-graceful_shutdown()
+logging.info(f"\nBackup successful. Total time: {format_hhmmss(time.time() - start_time)}")
