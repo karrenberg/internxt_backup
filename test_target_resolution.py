@@ -25,10 +25,11 @@ class TargetPathResolutionTest(unittest.TestCase):
             self.assertEqual(exit_context.exception.code, 2)
             run_cli.assert_not_called()
 
-    # Exercise the script entry point with a fake CLI so the test verifies both path
-    # resolution and the crucial absence of an extra nested source folder.
-    def test_named_target_is_resolved_from_root_and_used_directly(self):
-        target_uuid = "11111111-1111-1111-1111-111111111111"
+    # Exercise the script entry point with a fake CLI so the test verifies that a
+    # named target is the parent and the source basename is selected beneath it.
+    def test_named_target_is_resolved_as_destination_parent(self):
+        parent_uuid = "11111111-1111-1111-1111-111111111111"
+        source_uuid = "22222222-2222-2222-2222-222222222222"
         cli_commands = []
 
         # Return the smallest realistic Internxt responses needed by an empty backup.
@@ -40,11 +41,19 @@ class TargetPathResolutionTest(unittest.TestCase):
                 payload = {
                     "success": True,
                     "list": {
-                        "folders": [{"type": "folder", "plainName": "2025", "uuid": target_uuid}],
+                        "folders": [{"type": "folder", "plainName": "pictures", "uuid": parent_uuid}],
                         "files": [],
                     },
                 }
-            elif '"list"' in command and f'"--id={target_uuid}"' in command:
+            elif '"list"' in command and f'"--id={parent_uuid}"' in command:
+                payload = {
+                    "success": True,
+                    "list": {
+                        "folders": [{"type": "folder", "plainName": "2025", "uuid": source_uuid}],
+                        "files": [],
+                    },
+                }
+            elif '"list"' in command and f'"--id={source_uuid}"' in command:
                 payload = {"success": True, "list": {"folders": [], "files": []}}
             else:
                 self.fail(f"Unexpected CLI command: {command}")
@@ -57,7 +66,7 @@ class TargetPathResolutionTest(unittest.TestCase):
             old_cwd = os.getcwd()
             try:
                 os.chdir(temp_dir)
-                argv = ["internxt_backup.py", "-s", source, "-t", "2025", "--no-prescan"]
+                argv = ["internxt_backup.py", "-s", source, "-t", "pictures", "--no-prescan"]
                 with mock.patch.object(sys, "argv", argv), \
                         mock.patch("subprocess.run", side_effect=fake_run), \
                         mock.patch("platform.system", return_value="Windows"), \
@@ -66,6 +75,66 @@ class TargetPathResolutionTest(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
                 logging.shutdown()
+                for handler in logging.getLogger().handlers[:]:
+                    logging.getLogger().removeHandler(handler)
+                    handler.close()
+
+        self.assertFalse(any('"create-folder"' in command for command in cli_commands))
+        self.assertTrue(any(f'"--id={source_uuid}"' in command for command in cli_commands))
+
+    # A trailing wildcard changes only source-root placement: the resolved target
+    # itself receives the files and no duplicate basename folder is created.
+    def test_trailing_wildcard_copies_contents_into_target(self):
+        parent_uuid = "11111111-1111-1111-1111-111111111111"
+        target_uuid = "22222222-2222-2222-2222-222222222222"
+        cli_commands = []
+
+        # Model the exact /pictures/2024 hierarchy requested by the command line.
+        def fake_run(command, **kwargs):
+            cli_commands.append(command)
+            if '"whoami"' in command:
+                payload = {"success": True}
+            elif '"list"' in command and '"--id="' in command:
+                payload = {
+                    "success": True,
+                    "list": {
+                        "folders": [{"type": "folder", "plainName": "pictures", "uuid": parent_uuid}],
+                        "files": [],
+                    },
+                }
+            elif '"list"' in command and f'"--id={parent_uuid}"' in command:
+                payload = {
+                    "success": True,
+                    "list": {
+                        "folders": [{"type": "folder", "plainName": "2024", "uuid": target_uuid}],
+                        "files": [],
+                    },
+                }
+            elif '"list"' in command and f'"--id={target_uuid}"' in command:
+                payload = {"success": True, "list": {"folders": [], "files": []}}
+            else:
+                self.fail(f"Unexpected CLI command: {command}")
+            return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+        # Keep logs disposable while running the complete command-line entry point.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "2024")
+            os.mkdir(source)
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)
+                argv = ["internxt_backup.py", "-s", os.path.join(source, "*"), "-t", "pictures/2024", "--no-prescan"]
+                with mock.patch.object(sys, "argv", argv), \
+                        mock.patch("subprocess.run", side_effect=fake_run), \
+                        mock.patch("platform.system", return_value="Windows"), \
+                        mock.patch("atexit.register"):
+                    runpy.run_path(os.path.join(old_cwd, "internxt_backup.py"), run_name="__main__")
+            finally:
+                os.chdir(old_cwd)
+                logging.shutdown()
+                for handler in logging.getLogger().handlers[:]:
+                    logging.getLogger().removeHandler(handler)
+                    handler.close()
 
         self.assertFalse(any('"create-folder"' in command for command in cli_commands))
         self.assertTrue(any(f'"--id={target_uuid}"' in command for command in cli_commands))

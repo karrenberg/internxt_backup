@@ -35,7 +35,7 @@ if 'MSYSTEM' in os.environ and os.environ['MSYSTEM'].startswith(('MINGW', 'MSYS'
 # Parse arguments
 parser = argparse.ArgumentParser(description="Backup uploader script.")
 parser.add_argument("-s", "--source", dest="src_dir", required=True, help="Source directory to upload")
-parser.add_argument("-t", "--target", dest="dest_id", required=True, nargs='?', const='', help="Exact root-relative destination path, destination parent UUID, or empty string for drive root")
+parser.add_argument("-t", "--target", dest="dest_id", required=True, nargs='?', const='', help="Destination parent: exact root-relative path, folder UUID, or empty string for drive root")
 parser.add_argument("-v", "--verbose", dest="verbose_mode", action='store_true', help="Enable verbose logging")
 parser.add_argument("-l", "--full-console-log", dest="full_console_log", action='store_true', help="log everything that is logged to file to the console as well")
 parser.add_argument("-r", "--max_num_retries", dest="max_num_retries", required=False, default=5, type=int, help="Set the maximum number of retries for internxt CLI commands (default: 5)")
@@ -462,18 +462,22 @@ def resolve_remote_folder_path(path):
 # Source/target directory setup
 ################################################################################
 
-SRC_DIR = normalize_encoding(args.src_dir)
+raw_src_dir = normalize_encoding(args.src_dir)
+trimmed_src_dir = raw_src_dir.rstrip("/\\")
+
+# Match cp/scp source semantics: a final standalone '*' selects the directory's
+# contents, while an ordinary directory source includes its basename at the target.
+COPY_SOURCE_CONTENTS = os.path.basename(trimmed_src_dir) == "*"
+SRC_DIR = os.path.dirname(trimmed_src_dir) if COPY_SOURCE_CONTENTS else raw_src_dir
 src_name = normalize_encoding(os.path.basename(os.path.normpath(SRC_DIR)))
 
 # Mapping from relative path to destination folder UUID
 folder_uuids = {}
 
-# Preserve the original UUID/empty-root contract: those values name the parent in
-# which the source folder is created. Paths instead name the source folder itself.
-if args.dest_id == "" or is_folder_uuid(args.dest_id):
-    DEST_ROOT_ID = get_or_create_folder_from_uuid(args.dest_id, src_name, ".")
-else:
-    DEST_ROOT_ID = resolve_remote_folder_path(args.dest_id)
+# Every target form names the destination parent. An ordinary directory source is
+# created/reused below it; a trailing '*' copies that directory's contents into it.
+DEST_PARENT_ID = args.dest_id if args.dest_id == "" or is_folder_uuid(args.dest_id) else resolve_remote_folder_path(args.dest_id)
+DEST_ROOT_ID = DEST_PARENT_ID if COPY_SOURCE_CONTENTS else get_or_create_folder_from_uuid(DEST_PARENT_ID, src_name, ".")
 
 # Map the local source root to the resolved or newly created remote source folder.
 folder_uuids["."] = DEST_ROOT_ID

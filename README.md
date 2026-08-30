@@ -42,9 +42,11 @@ python C:\Users\Me\internxt_backup\internxt_backup.py -e me@me.com -s C:\Users\M
 export PATH=/usr/bin/:$PATH
 python ~/internxt_backup/internxt_backup.py -e me@me.com -s ~/pictures/ -t "" -d
 
-# Sync to an existing folder by its exact path from drive root
-python internxt_backup.py --source /path/to/2025 --target "2025"
-python internxt_backup.py --source /path/to/somefolder --target "2025/somefolder"
+# Copy a source directory below an exact destination path, like cp/scp
+python internxt_backup.py --source /path/to/2025 --target "pictures"
+
+# Copy only the source directory's contents directly into the destination
+python internxt_backup.py --source "/path/to/2025/*" --target "pictures/2025"
 
 # Upload below drive root using the legacy parent-target behavior
 python internxt_backup.py --source /path/to/source --target ""
