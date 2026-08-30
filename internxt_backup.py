@@ -11,6 +11,7 @@ import platform
 import signal
 import atexit
 import getpass
+import re
 from urllib.parse import unquote
 
 # TODO: Validate that all files have been uploaded using "list"
@@ -32,10 +33,9 @@ if 'MSYSTEM' in os.environ and os.environ['MSYSTEM'].startswith(('MINGW', 'MSYS'
 ################################################################################
 
 # Parse arguments
-# TODO: Take "DST_DIR" arg (relative path string), create "find_id" helper, convert path to DEST_ROOT_ID
 parser = argparse.ArgumentParser(description="Backup uploader script.")
 parser.add_argument("-s", "--source", dest="src_dir", required=True, help="Source directory to upload")
-parser.add_argument("-t", "--target", dest="dest_id", required=True, nargs='?', const='', default=None, help="Destination base folder UUID (empty string or omit value for drive root)")
+parser.add_argument("-t", "--target", dest="dest_id", required=False, nargs='?', const='', default=None, help="Exact root-relative destination path, destination parent UUID, or empty string for drive root; defaults to the source folder name at drive root")
 parser.add_argument("-v", "--verbose", dest="verbose_mode", action='store_true', help="Enable verbose logging")
 parser.add_argument("-l", "--full-console-log", dest="full_console_log", action='store_true', help="log everything that is logged to file to the console as well")
 parser.add_argument("-r", "--max_num_retries", dest="max_num_retries", required=False, default=5, type=int, help="Set the maximum number of retries for internxt CLI commands (default: 5)")
@@ -428,22 +428,55 @@ def get_or_create_folder_from_uuid(parent_uuid, folder_name, parent_rel):
     items = get_cached_dir_listing(parent_uuid)
     return get_or_create_folder(items, parent_uuid, folder_name, parent_rel)
 
+def is_folder_uuid(value):
+    """Return whether a target uses the CLI's canonical folder UUID form."""
+    return bool(re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value,
+    ))
+
+def resolve_remote_folder_path(path):
+    """Resolve an exact drive-root-relative folder path without scanning siblings recursively."""
+    components = [normalize_encoding(part) for part in re.split(r"[\\/]", path.strip("/\\"))]
+    if not components or any(part in ("", ".", "..") for part in components):
+        logging.error(f"Invalid target path: {path!r}")
+        sys.exit(1)
+
+    # Walk only the explicitly named ancestors so lookup cost scales with path depth,
+    # not with the number of folders elsewhere in the drive.
+    folder_uuid = ""
+    resolved = []
+    for component in components:
+        item = get_cached_dir_listing(folder_uuid).get(component)
+        if not item or item.get("type") != "folder" or not item.get("uuid"):
+            expected_path = "/" + "/".join(resolved + [component])
+            logging.error(f"Target folder does not exist: {expected_path}")
+            sys.exit(1)
+        folder_uuid = item["uuid"]
+        resolved.append(component)
+
+    logging.info(f"Resolved target '/{'/'.join(resolved)}' -> ID: {folder_uuid}")
+    return folder_uuid
+
 ################################################################################
 # Source/target directory setup
 ################################################################################
 
 SRC_DIR = normalize_encoding(args.src_dir)
-DEST_ROOT_ID = args.dest_id
+src_name = normalize_encoding(os.path.basename(os.path.normpath(SRC_DIR)))
 
 # Mapping from relative path to destination folder UUID
 folder_uuids = {}
-folder_uuids["."] = DEST_ROOT_ID
 
-# Ensure the base source folder itself exists remotely (so we can nest into it)
-src_name = os.path.basename(os.path.normpath(SRC_DIR))
-DEST_ROOT_ID = get_or_create_folder_from_uuid(DEST_ROOT_ID, normalize_encoding(src_name), ".")
+# Preserve the original UUID/empty-root contract: those values name the parent in
+# which the source folder is created. Paths instead name the source folder itself.
+if args.dest_id is not None and (args.dest_id == "" or is_folder_uuid(args.dest_id)):
+    DEST_ROOT_ID = get_or_create_folder_from_uuid(args.dest_id, src_name, ".")
+else:
+    target_path = src_name if args.dest_id is None else args.dest_id
+    DEST_ROOT_ID = resolve_remote_folder_path(target_path)
 
-# re-map "." to the newly created/validated root folder UUID
+# Map the local source root to the resolved or newly created remote source folder.
 folder_uuids["."] = DEST_ROOT_ID
 
 ################################################################################

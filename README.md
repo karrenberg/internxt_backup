@@ -42,14 +42,20 @@ python C:\Users\Me\internxt_backup\internxt_backup.py -e me@me.com -s C:\Users\M
 export PATH=/usr/bin/:$PATH
 python ~/internxt_backup/internxt_backup.py -e me@me.com -s ~/pictures/ -t "" -d
 
-# Basic usage (upload to root folder)
+# Sync to an existing root folder with the same name as the source (for example /2025)
+python internxt_backup.py --source /path/to/2025
+
+# Sync to an existing folder by its exact path from drive root
+python internxt_backup.py --source /path/to/somefolder --target "2025/somefolder"
+
+# Upload below drive root using the legacy parent-target behavior
 python internxt_backup.py --source /path/to/source --target ""
 
 # Sync source folder (= upload missing files, re-upload files with different size,
 # delete files/folders that don't exist locally)
 python internxt_backup.py --source /path/to/source --target "" --allow-delete
 
-# Upload to specific folder ID (easiest to log into web client, navigate to folder, copy from URL)
+# Upload below a specific parent folder ID (easiest to log into web client, navigate to folder, copy from URL)
 python internxt_backup.py --source /path/to/source --target "12345678-abcd-efgh-90abcdef"
 
 # Log everything to console in addition to logging to file (default is to log everything to file
