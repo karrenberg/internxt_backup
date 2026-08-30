@@ -42,10 +42,8 @@ python C:\Users\Me\internxt_backup\internxt_backup.py -e me@me.com -s C:\Users\M
 export PATH=/usr/bin/:$PATH
 python ~/internxt_backup/internxt_backup.py -e me@me.com -s ~/pictures/ -t "" -d
 
-# Sync to an existing root folder with the same name as the source (for example /2025)
-python internxt_backup.py --source /path/to/2025
-
 # Sync to an existing folder by its exact path from drive root
+python internxt_backup.py --source /path/to/2025 --target "2025"
 python internxt_backup.py --source /path/to/somefolder --target "2025/somefolder"
 
 # Upload below drive root using the legacy parent-target behavior

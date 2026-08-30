@@ -10,6 +10,21 @@ from unittest import mock
 
 
 class TargetPathResolutionTest(unittest.TestCase):
+    # The target is safety-critical, so argparse must reject an invocation that omits it
+    # before authentication or any remote operation can occur.
+    def test_target_is_required(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "2025")
+            os.mkdir(source)
+            argv = ["internxt_backup.py", "-s", source, "--no-prescan"]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch("subprocess.run") as run_cli, \
+                    mock.patch("atexit.register"):
+                with self.assertRaises(SystemExit) as exit_context:
+                    runpy.run_path(os.path.join(os.path.dirname(__file__), "internxt_backup.py"), run_name="__main__")
+            self.assertEqual(exit_context.exception.code, 2)
+            run_cli.assert_not_called()
+
     # Exercise the script entry point with a fake CLI so the test verifies both path
     # resolution and the crucial absence of an extra nested source folder.
     def test_named_target_is_resolved_from_root_and_used_directly(self):

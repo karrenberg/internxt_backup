@@ -35,7 +35,7 @@ if 'MSYSTEM' in os.environ and os.environ['MSYSTEM'].startswith(('MINGW', 'MSYS'
 # Parse arguments
 parser = argparse.ArgumentParser(description="Backup uploader script.")
 parser.add_argument("-s", "--source", dest="src_dir", required=True, help="Source directory to upload")
-parser.add_argument("-t", "--target", dest="dest_id", required=False, nargs='?', const='', default=None, help="Exact root-relative destination path, destination parent UUID, or empty string for drive root; defaults to the source folder name at drive root")
+parser.add_argument("-t", "--target", dest="dest_id", required=True, nargs='?', const='', help="Exact root-relative destination path, destination parent UUID, or empty string for drive root")
 parser.add_argument("-v", "--verbose", dest="verbose_mode", action='store_true', help="Enable verbose logging")
 parser.add_argument("-l", "--full-console-log", dest="full_console_log", action='store_true', help="log everything that is logged to file to the console as well")
 parser.add_argument("-r", "--max_num_retries", dest="max_num_retries", required=False, default=5, type=int, help="Set the maximum number of retries for internxt CLI commands (default: 5)")
@@ -470,11 +470,10 @@ folder_uuids = {}
 
 # Preserve the original UUID/empty-root contract: those values name the parent in
 # which the source folder is created. Paths instead name the source folder itself.
-if args.dest_id is not None and (args.dest_id == "" or is_folder_uuid(args.dest_id)):
+if args.dest_id == "" or is_folder_uuid(args.dest_id):
     DEST_ROOT_ID = get_or_create_folder_from_uuid(args.dest_id, src_name, ".")
 else:
-    target_path = src_name if args.dest_id is None else args.dest_id
-    DEST_ROOT_ID = resolve_remote_folder_path(target_path)
+    DEST_ROOT_ID = resolve_remote_folder_path(args.dest_id)
 
 # Map the local source root to the resolved or newly created remote source folder.
 folder_uuids["."] = DEST_ROOT_ID
