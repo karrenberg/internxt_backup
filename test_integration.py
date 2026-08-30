@@ -54,6 +54,35 @@ def test_create_single_subfolder(remote_folder, credentials, tmp_path):
 
 
 @pytest.mark.integration
+def test_renamed_folder_keeps_remote_uuid(remote_folder, credentials, tmp_path):
+    """A uniquely matching local folder rename is applied remotely without re-uploading."""
+    src = tmp_path / "rename_test"
+    old_local = src / "old-name"
+    old_local.mkdir(parents=True)
+    (old_local / "same.txt").write_text("same")
+
+    run_backup(str(src), remote_folder, credentials, extra_args=["--allow_delete", "--no-prescan"])
+    root_listing = list_remote(remote_folder)
+    root = next((f for f in root_listing["folders"] if f.get("plainName") == src.name), None)
+    assert root is not None
+    before = list_remote(root["uuid"])
+    old_remote = next((f for f in before["folders"] if f.get("plainName") == "old-name"), None)
+    assert old_remote is not None
+
+    old_local.rename(src / "new-name")
+    result = run_backup(str(src), remote_folder, credentials, extra_args=["--allow_delete", "--no-prescan"])
+
+    after = list_remote(root["uuid"])
+    new_remote = next((f for f in after["folders"] if f.get("plainName") == "new-name"), None)
+    assert new_remote is not None
+    assert new_remote["uuid"] == old_remote["uuid"]
+    assert "old-name" not in remote_folder_names_from(after)
+    counts = parse_summary(result.stdout)
+    assert counts["uploaded"] == 0
+    assert counts["removed"] == 0
+
+
+@pytest.mark.integration
 def test_skip_existing_file(remote_folder, credentials, tmp_path):
     """A file already uploaded is skipped (not re-uploaded) on the second run."""
     src = tmp_path / "skip_test"

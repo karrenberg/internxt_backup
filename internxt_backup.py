@@ -458,6 +458,127 @@ def resolve_remote_folder_path(path):
     logging.info(f"Resolved target '/{'/'.join(resolved)}' -> ID: {folder_uuid}")
     return folder_uuid
 
+def _manifest_path(path):
+    """Use a platform-independent relative path in folder manifests."""
+    return normalize_encoding(path).replace("\\", "/")
+
+def get_local_folder_manifest(folder_path):
+    """Describe a local folder by relative directory names and exact file sizes."""
+    entries = []
+    for cur_dir, dirs, files in os.walk(folder_path):
+        # Mirror the backup walk by excluding subtrees marked with .internxtignore.
+        kept_dirs = []
+        for name in dirs:
+            if os.path.isfile(os.path.join(cur_dir, name, IGNOREFILE_NAME)):
+                continue
+            kept_dirs.append(name)
+            rel_path = os.path.relpath(os.path.join(cur_dir, name), folder_path)
+            entries.append(("folder", _manifest_path(rel_path)))
+        dirs[:] = kept_dirs
+
+        for name in files:
+            abs_path = os.path.join(cur_dir, name)
+            try:
+                size = os.path.getsize(abs_path)
+            except OSError as e:
+                logging.warning(f"Cannot compare rename candidate '{abs_path}': {e}")
+                return None
+            if size <= FILE_SIZE_UPLOAD_LIMIT_BYTES:
+                rel_path = os.path.relpath(abs_path, folder_path)
+                entries.append(("file", _manifest_path(rel_path), size))
+
+    return tuple(sorted(entries))
+
+def get_remote_folder_manifest(folder_uuid, visited=None):
+    """Describe a remote folder using the same names-and-byte-sizes representation."""
+    if visited is None:
+        visited = set()
+    if folder_uuid in visited:
+        logging.warning(f"Cannot compare remote rename candidate '{folder_uuid}': folder cycle detected")
+        return None
+    visited.add(folder_uuid)
+
+    entries = []
+    for name, item in get_cached_dir_listing(folder_uuid).items():
+        if item.get("type") == "folder":
+            child_uuid = item.get("uuid")
+            if not child_uuid:
+                return None
+            entries.append(("folder", name))
+            child_entries = get_remote_folder_manifest(child_uuid, visited)
+            if child_entries is None:
+                return None
+            for entry in child_entries:
+                entries.append((entry[0], f"{name}/{entry[1]}", *entry[2:]))
+        else:
+            try:
+                size = int(item.get("size", 0))
+            except (TypeError, ValueError):
+                return None
+            entries.append(("file", name, size))
+
+    visited.remove(folder_uuid)
+    return tuple(sorted(entries))
+
+def rename_remote_folder(parent_uuid, parent_items, old_name, new_name, folder_uuid):
+    """Rename one remote folder and keep the active parent listing coherent."""
+    out, num_retries, _ = run_cli(["rename-folder", f"--id={folder_uuid}", "--name", new_name])
+    if out is None:
+        logging.warning(f"Could not rename remote folder '{old_name}' to '{new_name}'")
+        return False
+    if num_retries > 0:
+        logging.info(f"Rename-folder command required {num_retries} retries: {old_name!r} -> {new_name!r}")
+
+    renamed_item = dict(parent_items.pop(old_name))
+    renamed_item["plainName"] = new_name
+    parent_items[new_name] = renamed_item
+    remote_dir_cache.pop(parent_uuid, None)
+    logging.info(f"Renamed remote folder '{old_name}' to '{new_name}' (same relative names and byte sizes)")
+    return True
+
+def detect_folder_renames(parent_uuid, parent_items, local_candidates, excluded_remote_names=None):
+    """Rename uniquely matching remote-only folders and return successful pairs."""
+    excluded_remote_names = excluded_remote_names or set()
+    remote_candidates = {
+        name: item for name, item in parent_items.items()
+        if item.get("type") == "folder"
+        and name not in local_candidates
+        and name not in excluded_remote_names
+        and item.get("uuid")
+    }
+    local_only = {
+        name: path for name, path in local_candidates.items()
+        if name not in parent_items
+    }
+    if not local_only or not remote_candidates:
+        return []
+
+    # Group both sides by complete manifests; only one-to-one matches are safe because
+    # two identical candidates do not reveal which folder the user renamed.
+    local_by_manifest = {}
+    for name, path in local_only.items():
+        manifest = get_local_folder_manifest(path)
+        if manifest is not None:
+            local_by_manifest.setdefault(manifest, []).append(name)
+
+    remote_by_manifest = {}
+    for name, item in remote_candidates.items():
+        manifest = get_remote_folder_manifest(item["uuid"])
+        if manifest is not None:
+            remote_by_manifest.setdefault(manifest, []).append(name)
+
+    renamed = []
+    for manifest, local_names in local_by_manifest.items():
+        remote_names = remote_by_manifest.get(manifest, [])
+        if len(local_names) != 1 or len(remote_names) != 1:
+            continue
+        new_name = local_names[0]
+        old_name = remote_names[0]
+        folder_uuid = parent_items[old_name]["uuid"]
+        if rename_remote_folder(parent_uuid, parent_items, old_name, new_name, folder_uuid):
+            renamed.append((old_name, new_name))
+    return renamed
+
 ################################################################################
 # Source/target directory setup
 ################################################################################
@@ -473,11 +594,18 @@ src_name = normalize_encoding(os.path.basename(os.path.normpath(SRC_DIR)))
 
 # Mapping from relative path to destination folder UUID
 folder_uuids = {}
+renamed_folders = []
 
 # Every target form names the destination parent. An ordinary directory source is
 # created/reused below it; a trailing '*' copies that directory's contents into it.
 DEST_PARENT_ID = args.dest_id if args.dest_id == "" or is_folder_uuid(args.dest_id) else resolve_remote_folder_path(args.dest_id)
-DEST_ROOT_ID = DEST_PARENT_ID if COPY_SOURCE_CONTENTS else get_or_create_folder_from_uuid(DEST_PARENT_ID, src_name, ".")
+if COPY_SOURCE_CONTENTS:
+    DEST_ROOT_ID = DEST_PARENT_ID
+else:
+    parent_items = get_cached_dir_listing(DEST_PARENT_ID)
+    if args.allow_delete and src_name not in parent_items:
+        renamed_folders.extend(detect_folder_renames(DEST_PARENT_ID, parent_items, {src_name: SRC_DIR}))
+    DEST_ROOT_ID = get_or_create_folder(parent_items, DEST_PARENT_ID, src_name, ".")
 
 # Map the local source root to the resolved or newly created remote source folder.
 folder_uuids["."] = DEST_ROOT_ID
@@ -709,8 +837,7 @@ for cur_dir, dirs, files in os.walk(SRC_DIR):
                 pass
     folder_remote_size[rel_cur_dir] = _remote_sz
 
-    # Step 4: pre-create/find all immediate subdirectories; prune .internxtignore folders.
-    # Iterating dirs[:] (a copy) because we mutate dirs to control os.walk's descent.
+    # Step 4a: prune .internxtignore folders before rename matching or creation.
     # Track items deleted here so Step 5 doesn't attempt a second deletion.
     ignored_and_deleted = set()
     for d in dirs[:]:
@@ -725,8 +852,24 @@ for cur_dir, dirs, files in os.walk(SRC_DIR):
                     delete_remote_folder(normalize_rel_path(rel_cur_dir, d_name), existing["uuid"])
                     ignored_and_deleted.add(d_name)
             dirs.remove(d)   # prevents os.walk from descending into d
-            continue
 
+    # Step 4b: match local-only folders to remote-only siblings before the old
+    # folder is deleted and a replacement is created.
+    if args.allow_delete:
+        local_candidates = {
+            normalize_encoding(d): os.path.join(cur_dir, d)
+            for d in dirs
+        }
+        renamed_folders.extend(detect_folder_renames(
+            folder_uuid,
+            remote_items,
+            local_candidates,
+            excluded_remote_names=ignored_and_deleted,
+        ))
+
+    # Step 4c: pre-create/find all immediate subdirectories for os.walk descent.
+    for d in dirs:
+        d_name = normalize_encoding(d)
         # Get existing remote folder or create a new one; record UUID for Step 1 of the child visit.
         was_existing = d_name in remote_items and remote_items[d_name].get("type") == "folder"
         d_uuid = get_or_create_folder(remote_items, folder_uuid, d_name, rel_cur_dir)
@@ -908,6 +1051,7 @@ sys.stdout.flush()
 
 logging.info(f"\nAll operations complete.")
 logging.info(f"Folders created: {num_created_folders}")
+logging.info(f"Folders renamed: {len(renamed_folders)}")
 logging.info(f"Folders removed: {len(removed_folders)}")
 logging.info(f"Files uploaded:  {len(uploaded_files)} ({format_size(uploaded_size)})")
 logging.info(f"Files skipped:   {len(skipped_files)}  ({format_size(skipped_size)})")

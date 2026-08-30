@@ -13,6 +13,7 @@ The internxt service frequently has connectivity issues that are not handled wel
 - The script does not upload a source file that already exists and has the same size (the CLI doesn't allow this anyway).
 - The script optionally (`--allow-delete`, `-d`) removes folders and files that are in the target but not in the source (or contain .internxtignore files).
 - The script optionally (`--allow-delete`, `-d`) removes files that exist in the target but have a different size (meaning they get re-uploaded).
+- With `--allow-delete`, a uniquely matching renamed folder is renamed remotely instead of re-uploaded. A match requires identical relative folder/file names and exact file sizes in bytes.
 - The script copies all files that do not exist remotely from source to target.
 - If a CLI command fails, the script automatically attempts up to 5 retries at increasing time intervals (configurable with `--max_num_retries N` and `--retry_wait_seconds M`).
 - If a CLI command fails all retries, the file is skipped.
