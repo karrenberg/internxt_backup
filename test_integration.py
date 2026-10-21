@@ -1,6 +1,10 @@
 import shutil
 import subprocess
+import os
+import platform
+import signal
 import time
+from pathlib import Path
 
 import pytest
 
@@ -34,6 +38,45 @@ def test_upload_single_file(remote_folder, credentials, tmp_path):
     root = next((f for f in lst["folders"] if f.get("plainName") == src.name), None)
     assert root is not None, f"Root folder '{src.name}' not found: {remote_folder_names_from(lst)}"
     assert "hello.txt" in remote_file_names(root["uuid"]), "hello.txt not found remotely"
+
+
+# Real uploads verify sync behavior with mixed file sizes; offline tests enforce worker scheduling deterministically.
+@pytest.mark.integration
+@pytest.mark.parametrize("no_prescan", [False, True])
+def test_mixed_size_uploads_and_replacements(remote_folder, credentials, tmp_path, no_prescan):
+    src = tmp_path / "parallel_uploads"
+    src.mkdir()
+    sizes = {"a.bin": 4096, "b.bin": 65536, "c.bin": 1024**2, "d.bin": 20 * 1024**2}
+    pattern = bytes(range(256))
+    for name, size in sizes.items():
+        (src / name).write_bytes((pattern * (size // len(pattern) + 1))[:size])
+    flags = ["--no-prescan"] if no_prescan else []
+    first = run_backup(str(src), remote_folder, credentials, extra_args=flags)
+    assert parse_summary(first.stdout)["uploaded"] == 4
+    root = next(item for item in list_remote(remote_folder)["folders"] if item.get("plainName") == src.name)
+    def observed_sizes():
+        return {f"{item['plainName']}.{item['type']}" if item.get("type") else item["plainName"]:
+                int(item["size"]) for item in list_remote(root["uuid"])["files"]}
+    assert observed_sizes() == sizes
+    rerun = run_backup(str(src), remote_folder, credentials, extra_args=flags)
+    counts = parse_summary(rerun.stdout)
+    assert counts["uploaded"] == 0 and counts["removed"] == 0 and counts["skipped"] == 4
+
+    for name in ("a.bin", "b.bin"):
+        with (src / name).open("ab") as output:
+            output.write(b"!")
+        sizes[name] += 1
+    replaced = run_backup(str(src), remote_folder, credentials, extra_args=[*flags, "--allow-delete"])
+    assert parse_summary(replaced.stdout)["uploaded"] == 2
+    assert parse_summary(replaced.stdout)["removed"] == 0
+    assert observed_sizes() == sizes
+
+    (src / "c.bin").unlink()
+    del sizes["c.bin"]
+    cleaned = run_backup(str(src), remote_folder, credentials, extra_args=[*flags, "--allow-delete"])
+    counts = parse_summary(cleaned.stdout)
+    assert counts["uploaded"] == 0 and counts["removed"] == 1
+    assert observed_sizes() == sizes
 
 
 @pytest.mark.integration
@@ -377,6 +420,35 @@ def test_special_char_filenames(remote_folder, credentials):
 
 
 @pytest.mark.integration
+def test_literal_percent_and_folder_suffix_names(remote_folder, credentials, tmp_path):
+    """Names that resemble URL escapes or folder markers stay literal through sync."""
+    src = tmp_path / "literal_names"
+    src.mkdir()
+    expected = {
+        "literal%20name.txt": b"percent escape is literal",
+        "100% done.txt": b"percent sign is literal",
+        "file.folder": b"extension is literal",
+        "README": b"extensionless name is literal",
+        "snow-\u96ea-\u00d6.txt": b"unicode name is literal",
+    }
+    for name, contents in expected.items():
+        (src / name).write_bytes(contents)
+
+    run_backup(str(src), remote_folder, credentials)
+    root_listing = list_remote(remote_folder)
+    root = next(item for item in root_listing["folders"] if item.get("plainName") == src.name)
+    listing = list_remote(root["uuid"])
+    observed = {f"{item['plainName']}.{item['type']}" if item.get("type") else item["plainName"]:
+                int(item["size"]) for item in listing["files"]}
+    assert observed == {name: len(contents) for name, contents in expected.items()}
+
+    rerun = run_backup(str(src), remote_folder, credentials)
+    counts = parse_summary(rerun.stdout)
+    assert counts["uploaded"] == 0
+    assert counts["skipped"] == len(expected)
+
+
+@pytest.mark.integration
 def test_allow_delete_folder(remote_folder, credentials, tmp_path):
     """Remote-only folders must be deleted when --allow_delete is set."""
     src = tmp_path / "folder_delete_test"
@@ -420,8 +492,8 @@ def test_size_mismatch_no_overwrite(remote_folder, credentials, tmp_path):
     counts = parse_summary(result2.stdout)
     assert counts["uploaded"] == 0, \
         f"File re-uploaded without --allow_delete:\n{result2.stdout}"
-    assert "different size" in result2.stdout and "--allow-delete" in result2.stdout, \
-        f"Expected size-mismatch message in output:\n{result2.stdout}"
+    assert "Keeping different-size remote file" in result2.stderr and "--allow-delete" in result2.stderr, \
+        f"Expected size-mismatch warning in stderr:\n{result2.stderr}"
 
     # The remote file must still be present — not silently deleted
     lst = list_remote(remote_folder)
@@ -496,46 +568,76 @@ def test_spaces_in_path(remote_folder, credentials, tmp_path):
 @pytest.mark.integration
 def test_interrupted_backup(remote_folder, credentials, tmp_path):
     """A backup interrupted mid-run must resume correctly: already-uploaded files are
-    skipped and only the remaining files are uploaded on the next run.
+    skipped and only the remaining or incomplete files are repaired on the next run.
 
-    Uses --progress-file to detect upload completions without parsing noisy stdout.
-    Validates remote state via list_remote() (same ground-truth approach as all other tests).
+    Wait for a confirmed upload in the backup log, then send a handled interrupt so
+    the wrapper can terminate and reap its owned CLI process tree.
     """
     src = tmp_path / "interrupt_test"
     src.mkdir()
-    # Files must be large enough that uploads take several hundred ms each so that the
-    # process can be reliably killed after the first file but before the last.
-    for i in range(6):
-        (src / f"file{i:02d}.txt").write_text(f"content {i}" * 50_000)
+    file_size = 5 * 1024**2
+    for i in range(8):
+        content = f"content {i}".encode("utf-8")
+        (src / f"file{i:02d}.bin").write_bytes((content * (file_size // len(content) + 1))[:file_size])
 
-    progress_file = tmp_path / "progress.txt"
-    # Use DEVNULL to prevent stdout/stderr pipe buffer deadlock: with --full-console-log
-    # the script can produce enough output to fill the OS pipe buffer (64 KB on Windows),
-    # blocking the process before any uploads complete.
+    started_at = time.time()
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0
     proc = subprocess.Popen(
-        backup_cmd(str(src), remote_folder, credentials,
-                   extra_args=["--progress-file", str(progress_file)]),
+        backup_cmd(str(src), remote_folder, credentials),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         cwd=PROJECT_ROOT,
+        shell=False,
+        creationflags=creationflags,
+        start_new_session=platform.system() != "Windows",
     )
 
-    # Wait until at least 1 file is confirmed uploaded, then kill
+    def send_interrupt():
+        if proc.poll() is not None:
+            return
+        if platform.system() == "Windows":
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            proc.send_signal(signal.SIGINT)
+
+    def kill_owned_tree():
+        if proc.poll() is not None:
+            return
+        if platform.system() == "Windows":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                           timeout=10, check=False, shell=False)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=30)
+
+    # Use the flushed file log instead of a special backup-only progress flag.
     deadline = time.time() + 120
+    upload_seen = False
     while time.time() < deadline:
-        if progress_file.exists() and progress_file.read_text().strip():
+        log_files = [path for path in Path(PROJECT_ROOT).glob("backup_*.log")
+                     if path.stat().st_mtime >= started_at]
+        if log_files:
+            latest_log = max(log_files, key=lambda path: path.stat().st_mtime_ns)
+            text = latest_log.read_text(encoding="utf-8")
+            upload_seen = any("CLI result: upload-file" in line and "success=True" in line
+                              for line in text.splitlines())
+        if upload_seen:
             break
         time.sleep(0.05)
     else:
-        proc.kill()
-        proc.wait()
+        send_interrupt()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            kill_owned_tree()
         pytest.fail("No uploads detected within 120s — backup may be stuck or all files skipped")
 
-    proc.kill()
     try:
+        send_interrupt()
         proc.wait(timeout=30)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        kill_owned_tree()
+        pytest.fail("Interrupted backup did not stop its owned process tree within 30 seconds")
+    assert proc.returncode == 130, f"Expected interrupt exit status 130, got {proc.returncode}"
 
     # Ground truth: query remote directly to see what was actually uploaded
     lst = list_remote(remote_folder)
@@ -543,27 +645,28 @@ def test_interrupted_backup(remote_folder, credentials, tmp_path):
     assert root is not None, "Root folder not created — no uploads completed before kill"
     files_after_interrupt = remote_file_names(root["uuid"])
     n_done = len(files_after_interrupt)
-    assert n_done >= 1, f"Expected ≥1 file uploaded before kill: {files_after_interrupt}"
-    if n_done >= 6:
+    assert n_done >= 1, f"Expected ≥1 file uploaded before interrupt: {files_after_interrupt}"
+    if n_done >= 8:
         pytest.skip(
-            "All 6 files uploaded before kill — kill was too late. "
-            "Enlarge file content or add more files to get a reliable interruption window."
+            "All files uploaded before the interrupt took effect; the recovery rerun is unnecessary."
         )
 
-    # Second run: already-uploaded files skipped, remainder uploaded
-    result2 = run_backup(str(src), remote_folder, credentials)
+    # A partial file is repaired only with the explicit replacement/deletion policy.
+    result2 = run_backup(str(src), remote_folder, credentials, extra_args=["--allow-delete"])
     counts = parse_summary(result2.stdout)
     assert counts["failed"] == 0, f"Second run had failures:\n{result2.stdout}"
-    assert counts["skipped"] == n_done, \
-        f"Expected {n_done} skipped (already uploaded), got {counts['skipped']}:\n{result2.stdout}"
-    assert counts["uploaded"] == 6 - n_done, \
-        f"Expected {6 - n_done} remaining files uploaded, got {counts['uploaded']}:\n{result2.stdout}"
+    assert counts["skipped"] + counts["uploaded"] == 8, \
+        f"Expected all 8 files skipped or uploaded, got {counts}:\n{result2.stdout}"
 
-    # All 6 files must be present remotely after the second run
+    # Every file must be present at the expected size after recovery.
     all_remote = remote_file_names(root["uuid"])
-    for i in range(6):
-        assert f"file{i:02d}.txt" in all_remote, \
-            f"file{i:02d}.txt missing after second run: {all_remote}"
+    for i in range(8):
+        assert f"file{i:02d}.bin" in all_remote, \
+            f"file{i:02d}.bin missing after second run: {all_remote}"
+    listing = list_remote(root["uuid"])
+    sizes = {f"{item.get('plainName', '')}.{item.get('type')}" if item.get("type") else item.get("plainName", ""):
+             int(item["size"]) for item in listing["files"]}
+    assert all(sizes.get(f"file{i:02d}.bin") == file_size for i in range(8))
 
 
 @pytest.mark.integration
@@ -585,7 +688,7 @@ def test_prescan_count_nested(remote_folder, credentials, tmp_path):
     run_backup(str(src), remote_folder, credentials)
     result2 = run_backup(str(src), remote_folder, credentials)
 
-    assert "0 files" in result2.stdout, \
+    assert "Pre-scan complete: 0 file(s)" in result2.stdout, \
         f"Pre-scan over-counted on second run (path separator bug?):\n{result2.stdout}"
     counts = parse_summary(result2.stdout)
     assert counts["uploaded"] == 0, f"Files re-uploaded on second run:\n{result2.stdout}"

@@ -1,527 +1,127 @@
 # internxt_backup
-Backup/sync script that uses the internxt cloud storage CLI.
+
+Backup/sync script that uses the Internxt cloud storage CLI.
 
 ## About
 
-This script uses the internxt CLI interface to back up / sync local files to an internxt cloud storage account.
+This script uses the Internxt CLI interface to back up or sync local files to an Internxt cloud storage account.
 
-This was written to have a comfortable, fully featured, automated, and robust backup utility.
-The internxt service frequently has connectivity issues that are not handled well by the web client, which also has problems when uploading many files and does not give any feedback while uploading.
+It is intended to be a comfortable, fully featured, automated, and robust backup utility. Internxt can have connectivity issues, and its web client can be unreliable when uploading many files without useful progress feedback.
 
 ## Features
-- The script creates the same folder structure in the cloud storage that exists locally, except for folders that contain a .internxtignore file.
-- The script does not upload a source file that already exists and has the same size (the CLI doesn't allow this anyway).
-- The script optionally (`--allow-delete`, `-d`) removes folders and files that are in the target but not in the source (or contain .internxtignore files).
-- The script optionally (`--allow-delete`, `-d`) removes files that exist in the target but have a different size (meaning they get re-uploaded).
-- With `--allow-delete`, a uniquely matching renamed folder is renamed remotely instead of re-uploaded. A match requires identical relative folder/file names and exact file sizes in bytes.
-- The script copies all files that do not exist remotely from source to target.
-- If a CLI command fails, the script automatically attempts up to 5 retries at increasing time intervals (configurable with `--max_num_retries N` and `--retry_wait_seconds M`).
-- If a CLI command fails all retries, the file is skipped.
-- All actions are logged to a log file. Some output such as a progress bar and summaries are also written to stdout.
-- If the script for some reason is stopped or crashes, the same command line can just be issued again and it will by definition of how it works resume where the last command stopped.
-- The script was written and tested against internxt CLI version 1.6.3.
-- The script was written and tested on Windows 11 with node-v22.18.0-win-x64 and on Ubuntu Server 24.04 with node v22.19.0.
+
+- Creates the same folder structure in cloud storage that exists locally, except for subfolders containing a `.internxtignore` file. A `.internxtignore` in the source root is treated as an ordinary file.
+- Skips a remote file when its literal name and size match the local file. This is a size-based check; equal size does not prove equal contents.
+- Copies files that do not exist remotely.
+- Optionally (`--allow-delete`, `-d`) removes remote-only files/folders and remote folders corresponding to ignored local subfolders.
+- Optionally (`--allow-delete`, `-d`) replaces different-size remote files using `upload-file --overwrite`, without deleting the existing file first.
+- With `--allow-delete`, preserves a uniquely matched renamed folder by renaming its existing remote UUID. Matching uses names and exact file sizes; ambiguous or incomplete matches are not treated as renames.
+- Prescan is enabled by default. It builds the complete action plan and exact upload totals up front, then reuses the remote listings during execution. `--no-prescan` starts folder-by-folder work sooner, while still listing existing remote folders.
+- Uses up to two upload workers within a single backup run by default. Only independent first upload attempts run in parallel; set `--upload-workers 1` for sequential uploads. Listings, retries, reconciliation, folder changes, and deletion remain sequential. Parallel uploads fall back to sequential execution when token-refresh timing is uncertain.
+- Retries transient CLI failures up to five total attempts by default, with bounded exponential backoff. Uncertain writes are checked against a fresh remote listing; unresolved operations make the run incomplete rather than being reported as successful.
+- Shows phase, folder/path, operation age, retry wait, and upload totals when prescanning. Redirected output gets a flushed progress heartbeat at least every 15 seconds during long operations; the CLI does not expose reliable byte-level transfer progress.
+- Logs CLI attempts and a final summary to a timestamped `backup_*.log`. If a run is interrupted, rerun the same command; the script rechecks remote names and sizes and skips work already present under its comparison policy.
+- Returns a nonzero exit status for unresolved or incomplete work. A failed branch and its ancestors are protected from remote-only cleanup while successful independent branches can still finish.
+- Requires Internxt CLI **1.6.10 or newer** for UUIDv7 folder IDs. The script checks the CLI version before remote work; CLI 1.6.10 also increased listing pagination to 1,000 items.
+- Accepts files up to the CLI's 100 GiB maximum, subject to account limits. Files that exceed the limit are reported as incomplete work.
+- Tested environments include Windows 11 with Node 22.18.0 and Ubuntu Server 24.04 with Node 22.23.3. Token-refresh timing for parallel uploads is verified for CLI 1.6.10; newer CLI versions run sequentially until their refresh behavior is checked.
 
 ## Usage
-The script requires the internxt CLI ("internxt.cmd" or "internxt") to be available in the shell. It also requires the node framework to be available.
 
-### Examples 
+Requirements: Python 3.10 or newer, Internxt CLI 1.6.10 or newer, and a CLI login in the same OS user account that runs the script. Log in manually with `internxt login` when needed; the backup no longer accepts email or password arguments. Keep that session available while the backup runs; the script preserves it and does not log out.
+
+To upgrade the CLI and check the installed version:
 
 ```bash
-# Example including PATH setup and login/logout
+npm install --global @internxt/cli@latest
+internxt --version
+```
+
+The reported version must be 1.6.10 or newer. Use the same Node/npm installation that provides the `internxt` command used by the backup.
+
+The source directory is copied as a named folder under the target. The target is a Drive-root-relative folder path, an existing folder UUID, or `""` for Drive root. Add `/*` to copy only the source directory's contents directly into the target:
+
+```bash
+# Copy /backups/photos as a folder below the existing Archive folder
+python internxt_backup.py --source /backups/photos --target "Archive"
+
+# Copy the contents of /backups/photos directly into Archive/Photos
+python internxt_backup.py --source "/backups/photos/*" --target "Archive/Photos"
+
+# Copy /backups/photos as a folder directly below Drive root
+python internxt_backup.py --source /backups/photos --target ""
+```
+
+### Examples
+
+```cmd
+# Windows: put the Node installation containing Internxt on PATH, verify/login, then run
 set PATH=C:\Users\Me\node-v22.18.0-win-x64;%PATH%
-internxt login -e me@me.com
-python C:\Users\Me\internxt_backup\internxt_backup.py -s C:\Users\Me\pictures -t "" -d
-internxt logout
+internxt --version
+# Run this only if you are not already logged in; leave the session in place
+internxt login
+python C:\Users\Me\internxt_backup\internxt_backup.py --source C:\Users\Me\pictures --target "" --allow-delete
+```
 
-# Example with automatic login/logout (password requested interactively)
-# This is known to not work properly in git bash, use -p or log in/out manually instead!
-# Windows cmd
-set PATH=C:\Users\Me\node-v22.18.0-win-x64;%PATH%
-python C:\Users\Me\internxt_backup\internxt_backup.py -e me@me.com -s C:\Users\Me\pictures -t "" -d
-# Linux
-export PATH=/usr/bin/:$PATH
-python ~/internxt_backup/internxt_backup.py -e me@me.com -s ~/pictures/ -t "" -d
+```bash
+# Linux: use the Node/npm installation that provides the installed CLI
+internxt --version
+# Run this only if you are not already logged in; leave the session in place
+internxt login
+python ~/internxt_backup/internxt_backup.py --source ~/pictures --target "" --allow-delete
 
-# Copy a source directory below an exact destination path, like cp/scp
-python internxt_backup.py --source /path/to/2025 --target "pictures"
+# Sync a source folder below a specific parent folder UUID
+python internxt_backup.py --source /path/to/2025 --target "01234567-89ab-4def-8123-456789abcdef"
 
-# Copy only the source directory's contents directly into the destination
-python internxt_backup.py --source "/path/to/2025/*" --target "pictures/2025"
+# Start processing folders before the full remote plan has been built
+python internxt_backup.py --source /path/to/source --target "Archive" --no-prescan
 
-# Upload below drive root using the legacy parent-target behavior
-python internxt_backup.py --source /path/to/source --target ""
+# Disable parallel uploads for this run
+python internxt_backup.py --source /path/to/source --target "Archive" --upload-workers 1
 
-# Sync source folder (= upload missing files, re-upload files with different size,
-# delete files/folders that don't exist locally)
-python internxt_backup.py --source /path/to/source --target "" --allow-delete
+# Log informational messages to the console as well as to the log file
+python internxt_backup.py --source /path/to/source --target "Archive" --full-console-log
 
-# Upload below a specific parent folder ID (easiest to log into web client, navigate to folder, copy from URL)
-python internxt_backup.py --source /path/to/source --target "12345678-abcd-efgh-90abcdef"
+# Include each CLI attempt in the log
+python internxt_backup.py --source /path/to/source --target "Archive" --verbose
+```
 
-# Log everything to console in addition to logging to file (default is to log everything to file
-# and only some parts to console)
-python internxt_backup.py --source /path/to/source --target "" --full-console-log
+`--allow-delete` authorizes both replacement of different-size files and deletion of remote-only or ignored items. Without it, a different-size remote file is retained and reported as a policy skip. Use the option only when that synchronization policy is intended.
 
-# Verbose logging (logs every command; known to have some issues)
-python internxt_backup.py --source /path/to/source --target "" --verbose
+### Retry, timeout, and result options
+
+- `-r`, `--max_num_retries`, or `--max-attempts` sets the **total attempts** per CLI operation (default: 5). The legacy `--max_num_retries` name does not mean five extra attempts.
+- `-w` or `--retry_wait_seconds` sets the base retry delay (default: 3 seconds). Exponential waits are capped at 60 seconds and use bounded jitter.
+- Metadata commands have a 300-second whole-command deadline by default. Use `--command-timeout SECONDS` to override it.
+- Upload deadlines default to `max(1800, 300 + file_size_bytes / 131072)` seconds per attempt. Use `--upload-timeout SECONDS` to override this whole-command deadline; it is not an idle timer. Large upload deadlines can cause a file to run alone when there is not enough token lifetime for a safe parallel pair.
+- `--no-prescan` starts execution earlier but does not eliminate the remote listings needed to compare existing folders; exact planned upload totals are unavailable until work completes.
+
+The exit status is 0 when the selected size-based policy completed, 1 for incomplete or unresolved work, 2 for invalid command-line input, and 130 when interrupted. Review the summary and timestamped log before treating a run as complete.
+
+## Tests
+
+The offline regression suite requires pytest, but no CLI installation or login:
+
+```bash
+python -m pytest -m "not integration"
+```
+
+Live integration tests are opt-in. Install the CLI, log in manually, and choose a disposable test parent folder. The tests create unique children beneath that parent, exercise upload/list/replacement/deletion with synthetic files through 20 MiB, and clean up their own children while preserving the parent and the login. No folder UUID or account credentials are supplied by the repository:
+
+```bash
+# Linux example: replace the placeholder with your disposable test parent's UUID
+INTERNXT_TEST_FOLDER_ID="<disposable-folder-uuid>" python -m pytest -m integration
 ```
 
 ## Known Issues
-- Password prompt does not work in git bash, causes a hang. Use -p or log in/out manually.
-- Some files with special characters will upload fine but in subsequent runs fail to be recognized as existing files. This leads to repeated failed/skipped uploads, but the files are there.
-- I've encountered one weird case where uploading an entire folder would fail 2 random files (different ones when trying to re-upload the entire folder!). In subsequent runs, these files are reported to exist, but they don't appear in the web client. I don't think this is a problem with this script but with internxt. I have not reached out to them yet.
+
+- Internxt can return transient 502 responses, connection resets, and upload connection timeouts. The script retries these errors, continues independent branches, and exits nonzero if an operation remains unresolved. The log records each CLI attempt and the reconciliation listings.
+- A persistent “file already exists” response that cannot be matched in a fresh listing is treated as an unresolved conflict. The script does not merge ambiguous names or claim success based only on that response.
+- Legacy remote names with unusual encoding may not compare literally with local names. The script logs candidate transformations for diagnosis, but does not automatically merge or delete ambiguous entries.
+- Same-name, same-size files are skipped without reading or hashing their contents. Content corruption that preserves the byte size cannot be detected by this policy.
 
 # Internxt Resources
 
-* CLI Reference: https://raw.githubusercontent.com/internxt/cli/refs/heads/main/README.md
+* CLI Reference: https://github.com/internxt/cli
 * Additional information: https://help.internxt.com/en/articles/9178044-does-internxt-support-webdav
-
-# Internxt CLI Commands
-
-Only the commands used by internxt_backup.py are listed here.
-Written against @internxt/cli/1.6.3.
-Copy-pasted from the internxt reference plus actual output JSON, so an AI can reason about this properly.
-
-<!-- commands -->
-* [`internxt whoami`](#internxt-whoami)
-* [`internxt login-legacy`](#internxt-login-legacy)
-* [`internxt logout`](#internxt-logout)
-* [`internxt list`](#internxt-list)
-* [`internxt create-folder`](#internxt-create-folder)
-* [`internxt delete-permanently-file`](#internxt-delete-permanently-file)
-* [`internxt delete-permanently-folder`](#internxt-delete-permanently-folder)
-* [`internxt upload-file`](#internxt-upload-file)
-
-## `internxt whoami`
-
-Display the current user logged into the Internxt CLI.
-
-```
-USAGE
-  $ internxt whoami [--json]
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Display the current user logged into the Internxt CLI.
-
-EXAMPLES
-  $ internxt whoami --json -x
-
-EXAMPLE OUTPUT
-  {
-    "success": true,
-    "message": "You are logged in as: <email>.",
-    "login": {
-      "user": {
-        "email": "<email>",
-        "userId": "<userId-hash>",
-        "mnemonic": "<mnemonic>",
-        "root_folder_id": 123456789,
-        "rootFolderId": "<uuid>",
-        "name": "My",
-        "lastname": "Internxt",
-        "uuid": "<uuid>",
-        "credit": 0,
-        "createdAt": "2025-05-26T09:54:23.000Z",
-        "privateKey": "<privateKey>",
-        "publicKey": "<publicKey>",
-        "revocateKey": "<revocateKey>",
-        "tierId": "<uuid>",
-        "keys": {
-          "ecc": {
-            "privateKey": "<privateKey>",
-            "publicKey": "<publicKey>"
-          },
-          "kyber": {
-            "privateKey": "<privateKey>",
-            "publicKey": "<publicKey>"
-          }
-        },
-        "bucket": "<bucketid>",
-        "registerCompleted": true,
-        "teams": false,
-        "username": "<email>",
-        "bridgeUser": "<email>",
-        "sharedWorkspace": false,
-        "appSumoDetails": null,
-        "hasReferralsProgram": false,
-        "backupsBucket": "<bucketid>",
-        "avatar": null,
-        "emailVerified": true,
-        "lastPasswordChangedAt": "2026-02-13T19:40:00.000Z"
-      },
-      "token": "<jwt-token>"
-    }
-  }
-```
-
-_See code: [src/commands/whoami.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/whoami.ts)_
-
-## `internxt login-legacy`
-
-Logs into an Internxt account using legacy authentication (required for accounts without two-factor).
-
-```
-USAGE
-  $ internxt login-legacy [--json] [-e <value>] [-p <value>]
-
-FLAGS
-  -e, --email=<value>     The email to log in
-  -p, --password=<value>  The plain password to log in
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Logs into an Internxt account using legacy authentication (required for accounts without two-factor).
-
-EXAMPLES
-  $ internxt login-legacy -e me@example.com --json
-
-EXAMPLE OUTPUT
-  {
-    "success": true,
-    "message": "Succesfully logged in to: <email>.",
-    "login": {
-      "user": {
-        "email": "<email>",
-        "userId": "<userId-hash>",
-        "mnemonic": "<mnemonic>",
-        "root_folder_id": 123456789,
-        "rootFolderId": "<uuid>",
-        "name": "My",
-        "lastname": "Internxt",
-        "uuid": "<uuid>",
-        "credit": 0,
-        "createdAt": "2025-05-26T09:54:23.000Z",
-        "privateKey": "<privateKey>",
-        "publicKey": "<publicKey>",
-        "revocateKey": "<revocateKey>",
-        "tierId": "<uuid>",
-        "keys": {
-          "ecc": {
-            "privateKey": "<privateKey>",
-            "publicKey": "<publicKey>"
-          },
-          "kyber": {
-            "privateKey": "<privateKey>",
-            "publicKey": "<publicKey>"
-          }
-        },
-        "bucket": "<bucketid>",
-        "registerCompleted": true,
-        "teams": false,
-        "username": "<email>",
-        "bridgeUser": "<email>",
-        "sharedWorkspace": false,
-        "appSumoDetails": null,
-        "hasReferralsProgram": false,
-        "backupsBucket": "<bucketid>",
-        "avatar": null,
-        "emailVerified": true,
-        "lastPasswordChangedAt": "2026-02-13T19:40:00.000Z"
-      },
-      "token": "<jwt-token>"
-    }
-  }
-```
-
-_See code: [src/commands/login-legacy.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/login-legacy.ts)_
-
-## `internxt logout`
-
-Logs out the current internxt user that is logged into the Internxt CLI.
-
-```
-USAGE
-  $ internxt logout [--json]
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Logs out the current internxt user that is logged into the Internxt CLI.
-
-EXAMPLES
-  $ internxt logout --json
-
-EXAMPLE OUTPUT
-  {
-    "success": true,
-    "message": "User logged out successfully."
-  }
-```
-
-_See code: [src/commands/logout.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/logout.ts)_
-
-## `internxt list`
-
-Lists the content of a folder id.
-
-```
-USAGE
-  $ internxt list [--json] [-x] [-i <value>] [-e]
-
-FLAGS
-  -e, --extended    Displays additional information in the list.
-  -i, --id=<value>  The folder id to list. Leave empty for the root folder.
-
-HELPER FLAGS
-  -x, --non-interactive  Prevents the CLI from being interactive. When enabled, the CLI will not request input through
-                         the console and will throw errors directly.
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Lists the content of a folder id.
-
-EXAMPLES
-  $ internxt list --json
-
-EXAMPLE OUTPUT
-  {
-    "success": true,
-    "list": {
-      "folders": [
-        {
-          "type": "folder",
-          "id": 118633976,
-          "parentId": 123456789,
-          "parentUuid": "<uuid>",
-          "name": "<verylonghash>",
-          "parent": null,
-          "bucket": null,
-          "userId": 1234567,
-          "user": null,
-          "encryptVersion": "03-aes",
-          "deleted": false,
-          "deletedAt": null,
-          "createdAt": "2025-05-26T09:54:23.000Z",
-          "updatedAt": "2025-05-26T09:54:23.000Z",
-          "uuid": "<uuid>",
-          "plainName": "testfolder1",
-          "size": 0,
-          "removed": false,
-          "removedAt": null,
-          "sharings": [],
-          "creationTime": "2025-05-26T09:54:22.894Z",
-          "modificationTime": "2025-05-26T09:54:22.894Z",
-          "status": "EXISTS"
-        }
-      ],
-      "files": [
-      {
-        "id": 123456789,
-        "fileId": "<fileid>",
-        "folderId": <folderid>,
-        "folder": null,
-        "name": "<verylonghash>",
-        "type": "txt",
-        "size": "85",
-        "bucket": "<bucketid>",
-        "encryptVersion": "03-aes",
-        "deleted": false,
-        "deletedAt": null,
-        "userId": 1234567,
-        "user": null,
-        "creationTime": "2025-08-07T21:06:24.000Z",
-        "modificationTime": "2025-08-07T21:06:24.000Z",
-        "createdAt": "2025-08-07T21:06:23.733Z",
-        "updatedAt": "2025-08-07T21:06:24.000Z",
-        "folderUuid": "<uuid>",
-        "uuid": "<uuid>",
-        "plainName": "testfile",
-        "removed": false,
-        "removedAt": null,
-        "status": "EXISTS",
-        "thumbnails": [],
-        "sharings": []
-      }
-    ]
-    }
-  }
-```
-
-_See code: [src/commands/list.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/list.ts)_
-
-## `internxt create-folder`
-
-Create a folder in your Internxt Drive
-
-```
-USAGE
-  $ internxt create-folder [--json] [-x] [-n <value>] [-i <value>]
-
-FLAGS
-  -i, --id=<value>    The ID of the folder where the new folder will be created. Defaults to your root folder if not
-                      specified.
-  -n, --name=<value>  The new name for the folder
-
-HELPER FLAGS
-  -x, --non-interactive  Prevents the CLI from being interactive. When enabled, the CLI will not request input through
-                         the console and will throw errors directly.
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Create a folder in your Internxt Drive
-
-EXAMPLES
-  $ internxt create-folder
-
-EXAMPLE OUTPUT
-  {
-    "success": true,
-    "message": "Folder testfolder created successfully, view it at https://drive.internxt.com/folder/b499f804-af5b-4aa5-8059-1c346cce76b7",
-    "folder": {
-      "type": "folder",
-      "id": 123456789,
-      "parentId": 123456789,
-      "parentUuid": "<uuid>",
-      "name": "<verylonghash>",
-      "parent": null,
-      "bucket": null,
-      "userId": 1234567,
-      "user": null,
-      "encryptVersion": "03-aes",
-      "deleted": false,
-      "deletedAt": null,
-      "createdAt": "2025-08-08T07:38:28.000Z",
-      "updatedAt": "2025-08-08T07:38:28.000Z",
-      "uuid": "<uuid>",
-      "plainName": "testfolder",
-      "size": 0,
-      "removed": false,
-      "removedAt": null,
-      "creationTime": "2025-08-08T07:38:27.978Z",
-      "modificationTime": "2025-08-08T07:38:27.978Z",
-      "status": "EXISTS"
-    }
-  }
-```
-
-_See code: [src/commands/create-folder.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/create-folder.ts)_
-
-## `internxt delete-permanently-file`
-
-Deletes permanently a file. This action cannot be undone.
-
-```
-USAGE
-  $ internxt delete-permanently-file [--json] [-x] [-i <value>]
-
-FLAGS
-  -i, --id=<value>  The file id to be permanently deleted.
-
-HELPER FLAGS
-  -x, --non-interactive  Prevents the CLI from being interactive. When enabled, the CLI will not request input through
-                         the console and will throw errors directly.
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Deletes permanently a file. This action cannot be undone.
-
-EXAMPLES
-  $ internxt delete-permanently-file --id=<file-uuid> --json -x
-
-EXAMPLE OUTPUT
-  {
-    "success": true,
-    "message": "File permanently deleted successfully"
-  }
-```
-
-_See code: [src/commands/delete-permanently-file.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/delete-permanently-file.ts)_
-
-## `internxt delete-permanently-folder`
-
-Deletes permanently a folder. This action cannot be undone.
-
-```
-USAGE
-  $ internxt delete-permanently-folder [--json] [-x] [-i <value>]
-
-FLAGS
-  -i, --id=<value>  The folder id to be permanently deleted.
-
-HELPER FLAGS
-  -x, --non-interactive  Prevents the CLI from being interactive. When enabled, the CLI will not request input through
-                         the console and will throw errors directly.
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Deletes permanently a folder. This action cannot be undone.
-
-EXAMPLES
-  $ internxt delete-permanently-folder --id=<folder-uuid> --json -x
-
-EXAMPLE OUTPUT
-  {
-    "success": true,
-    "message": "Folder permanently deleted successfully"
-  }
-```
-
-_See code: [src/commands/delete-permanently-folder.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/delete-permanently-folder.ts)_
-
-## `internxt upload-file`
-
-Upload a file to Internxt Drive
-
-```
-USAGE
-  $ internxt upload-file [--json] [-x] [-f <value>] [-i <value>]
-
-FLAGS
-  -f, --file=<value>         The path to the file on your system.
-  -i, --destination=<value>  The folder id where the file is going to be uploaded to. Leave empty for the root folder.
-
-HELPER FLAGS
-  -x, --non-interactive  Prevents the CLI from being interactive. When enabled, the CLI will not request input through
-                         the console and will throw errors directly.
-
-GLOBAL FLAGS
-  --json  Format output as json.
-
-DESCRIPTION
-  Upload a file to Internxt Drive
-
-EXAMPLES
-  $ internxt upload-file
-
-EXAMPLE OUTPUT
-{
-  "success": true,
-  "message": "File uploaded successfully in 00:00:01.234, view it at https://drive.internxt.com/file/<uuid>",
-  "file": {
-    "itemType": "file",
-    "name": "myfile",
-    "uuid": "<uuid>",
-    "size": "3185391",
-    "bucket": "<bucketid>",
-    "createdAt": "2026-04-06T12:43:31.158Z",
-    "updatedAt": "2026-04-06T12:43:31.000Z",
-    "fileId": "<fileid>",
-    "type": "jpg",
-    "status": "EXISTS",
-    "folderUuid": "<uuid>",
-    "creationTime": "2026-04-06T12:43:29.000Z",
-    "modificationTime": "2026-04-06T12:43:29.000Z",
-    "plainName": "myfile"
-  }
-}
-
-EXAMPLE OUTPUT
-{"success":false,"message":"File already exists"}
-```
-
-_See code: [src/commands/upload-file.ts](https://github.com/internxt/cli/blob/v1.6.3/src/commands/upload-file.ts)_
+* CLI 1.6.10 release notes: https://github.com/internxt/cli/releases/tag/v1.6.10
