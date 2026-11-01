@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import concurrent.futures
 import datetime as dt
 import json
 import logging
@@ -621,22 +620,22 @@ def local_directory_unchanged(directory: LocalDirectory) -> tuple[bool, str]:
         # actionable additions, removals, replacements, while each known file is checked separately.
         if (current_stat.st_dev, current_stat.st_ino) != directory.identity or current_names != expected_names:
             return False, (
-                f"Directory changed during backup: {directory.path} "
+                f"Directory changed during transfer: {directory.path} "
                 f"(identity {directory.identity!r}->{(current_stat.st_dev, current_stat.st_ino)!r}, "
                 f"entries {expected_names!r}->{current_names!r})"
             )
         for file in directory.files:
             current = file.path.stat()
             if current.st_size != file.size or current.st_mtime_ns != file.mtime_ns:
-                return False, f"Source file changed during backup: {file.path}"
+                return False, f"Source file changed during transfer: {file.path}"
         for name, snapshot in directory.ignored_children:
             marker = directory.path / name / IGNOREFILE_NAME
             try:
                 current = marker.stat()
             except OSError:
-                return False, f"Ignore marker changed during backup: {marker}"
+                return False, f"Ignore marker changed during transfer: {marker}"
             if snapshot is None or (current.st_size, current.st_mtime_ns) != snapshot:
-                return False, f"Ignore marker changed during backup: {marker}"
+                return False, f"Ignore marker changed during transfer: {marker}"
         return True, ""
     except OSError as exc:
         return False, f"Could not recheck source directory {directory.path}: {exc}"
@@ -949,7 +948,8 @@ class InternxtClient:
 
 
     def upload_file(self, file: LocalFile, parent_uuid: str, path: str, *, replacing: bool,
-                    first_result: CommandResult | None = None) -> tuple[bool, bool]:
+                    first_result: CommandResult | None = None,
+                    reconcile_by_size: bool = True) -> tuple[bool, bool]:
         if not file_unchanged(file):
             raise BranchError(f"Source file changed before upload: {file.path}")
         timeout = self.upload_timeout(file)
@@ -995,7 +995,9 @@ class InternxtClient:
                         f"upload-file reported success but no exact remote identity became visible for {path!r}; refusing another upload."
                     )
             if current is not None:
-                if current.size == file.size:
+                # An old equal-size file cannot prove that an scp-style overwrite reached the server.
+                # Such callers retry the authorized overwrite until a success response confirms it.
+                if current.size == file.size and reconcile_by_size:
                     self.record_mutation_file(parent_uuid, file.name, current)
                     if not file_unchanged(file):
                         raise BranchError(f"Source file changed during upload recovery: {file.path}")
@@ -1015,7 +1017,7 @@ class InternxtClient:
                     if current is None:
                         self.diagnose_name_mismatch(file.name, self.cache.get(parent_uuid))
                         break
-                    if current.size == file.size:
+                    if current.size == file.size and reconcile_by_size:
                         self.record_mutation_file(parent_uuid, file.name, current)
                         if not file_unchanged(file):
                             raise BranchError(f"Source file changed during upload recovery: {file.path}")

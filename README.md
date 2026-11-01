@@ -98,6 +98,26 @@ python internxt_backup.py --source /path/to/source --target "Archive" --verbose
 
 The exit status is 0 when the selected size-based policy completed, 1 for incomplete or unresolved work, 2 for invalid command-line input, and 130 when interrupted. Review the summary and timestamped log before treating a run as complete.
 
+## Simple file and directory copies
+
+`internxtcp` is a separate copy command using the same retry, timeout, upload recovery, and error reporting as the backup. It takes an **absolute named folder path** from Drive root; `/` means Drive root. The target folder must already exist. No UUID or remote prefix is needed.
+
+```bash
+internxtcp path/to/myfile -t /path/to/
+internxtcp -r path/to/mydir -t /path/to/other/dir/
+```
+
+These copy to `/path/to/myfile` and `/path/to/other/dir/mydir/`, respectively. Recursive copies create missing folders inside the copied tree and merge into an existing same-name directory. Matching filenames are overwritten, even when their sizes match. Remote-only items are retained, and `.internxtignore` does not exclude anything from a copy. Quote paths containing spaces or shell metacharacters.
+
+Keep `internxtcp.py` and `internxt_client.py` together. Add this repository to `PATH` to use the launchers (`internxtcp.cmd` on Windows, `internxtcp` on Linux/macOS), or run it directly:
+
+```bash
+python internxtcp.py path/to/myfile -t /path/to/
+python internxtcp.py -r path/to/mydir -t /path/to/other/dir/
+```
+
+Use the same Python, CLI, and manual-login prerequisites as the backup. `--max-attempts` (default 5), `--retry-wait-seconds` (default 3), `--command-timeout`, `--upload-timeout`, and `--verbose` control retry/reporting behavior. Here `-r` means recursive. Diagnostics go to `internxtcp_*.log`; exit statuses are 0 for completion, 1 for incomplete work, 2 for invalid input, and 130 for interruption. If an equal-size overwrite has an uncertain response, size alone cannot confirm it; the command retries the overwrite and reports failure if no upload success response confirms it.
+
 ## Tests
 
 The offline regression suite requires pytest, but no CLI installation or login:

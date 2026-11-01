@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+
+# Keep the executable a thin entry point so both platforms run the same command implementation.
+from internxtcp import main
+
+raise SystemExit(main())
